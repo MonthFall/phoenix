@@ -271,13 +271,16 @@ def run_fig8():
     Log.info("Small size result")
     bin_path = os.path.join(build_root, "bin/end-to-end")
 
-    result = [pd.DataFrame(columns=["end to end", "io"]), pd.DataFrame(columns=["end to end", "io"])]
+    result = [pd.DataFrame(columns=["end to end", "io"]), pd.DataFrame(columns=["end to end", "io"]), pd.DataFrame(columns=["end to end", "io"])]
     pattern = r"\s*(\d+?.\d*)\s*us"
 
-    for t in [0, 1]:
+    # t=0: Phoenix(phxfs), t=2: Native POSIX(native); GDS(t=1) skipped, result[1] left empty
+    print(f"  [GDS] skipped (not available)", flush=True)
+    for t_idx, t in enumerate([0, 2]):
         GB = 1024 * 1024 * 1024
         for bs in [GB, 2 * GB, 4 * GB]:
-            data = run_cmd(bin_path, [file_path, bs, "phxfs" if t == 0 else "gds"])
+            print_progress(SYSTEM_NAMES[t], "size", f"{bs // GB}GB")
+            data = run_cmd(bin_path, [file_path, bs, "phxfs" if t == 0 else "native", gpu_id])
             if only_get_command:
                 continue
             data = data.split("\n")[-3:-1]
@@ -288,16 +291,17 @@ def run_fig8():
                     tmp.append(m.group(1))
                 else:
                     print("not match")
-            result[t].loc[len(result[t])] = tmp
+            result[t_idx].loc[len(result[t_idx])] = tmp
+            print_progress(SYSTEM_NAMES[t], "size", f"{bs // GB}GB", f"e2e={tmp[0]} us" if tmp else None)
     if only_get_command:
         return
     
     final_result = pd.concat(result, 
     axis=1,
-    keys=["Phoenix", "NVIDIA GDS"])
+    keys=["Phoenix", "GDS", "Native POSIX"])
     final_result["block size(GB)"] = [1, 2, 4]
     final_result.set_index("block size(GB)", inplace=True)
-    final_result.to_excel("results/fig8.xlsx", index=True, merge_cells=True)
+    final_result.to_csv(os.path.join(result_dir, "fig8.csv"), index=True)
 
 def run_fig9():
     return 0

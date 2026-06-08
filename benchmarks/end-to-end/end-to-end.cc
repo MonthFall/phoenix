@@ -152,6 +152,58 @@ static inline void loop_phxfs_large(struct IOParams *params){
 
 }
 
+static inline void loop_native_large(struct IOParams *params){
+    struct timespec start, end;
+    struct timespec io_start, io_end;
+    int file_fd;
+    int device_id = params->device_id;
+    void *gpu_buffer;
+    void *cpu_buffer;
+    ssize_t result;
+    
+    check_cudaruntimecall(cudaSetDevice(device_id));
+    file_fd = open(params->file_path.c_str(), O_RDWR | O_CREAT | O_DIRECT, 0664);
+    if (file_fd < 0){
+        printf("open file failed\n");
+        exit(1);
+    }
+
+    check_cudaruntimecall(cudaMalloc(&gpu_buffer, params->io_size));
+    int ret = posix_memalign(&cpu_buffer, 4096, params->io_size);
+    if (ret != 0){
+        printf("cpu buffer alloc failed\n");
+        exit(1);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    clock_gettime(CLOCK_MONOTONIC, &io_start);
+    {
+        ssize_t total_read = 0;
+        while (total_read < (ssize_t)params->io_size) {
+            result = pread(file_fd, (char *)cpu_buffer + total_read,
+                           params->io_size - total_read,
+                           params->loop_idx * params->io_size + total_read);
+            if (result <= 0) {
+                printf("native pread failed: %zd (total_read=%zd)\n", result, total_read);
+                exit(1);
+            }
+            total_read += result;
+        }
+    }
+    check_cudaruntimecall(cudaMemcpy(gpu_buffer, cpu_buffer, params->io_size, cudaMemcpyHostToDevice));
+    check_cudaruntimecall(cudaStreamSynchronize(0));
+    clock_gettime(CLOCK_MONOTONIC, &io_end);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    free(cpu_buffer);
+    check_cudaruntimecall(cudaFree(gpu_buffer));
+    close(file_fd);
+    unsigned long long total_time = (end.tv_sec - start.tv_sec) * 1000000000 + (end.tv_nsec - start.tv_nsec);
+    unsigned long long io_time = (io_end.tv_sec - io_start.tv_sec) * 1000000000 + (io_end.tv_nsec - io_start.tv_nsec);
+    params->io_latency_vec.push_back(io_time);
+    params->latency_vec.push_back(total_time);
+}
+
 static ssize_t loop_cnt = 10;
 int main(int argc, char* argv[]){
     if (argc != 5){
@@ -168,12 +220,16 @@ int main(int argc, char* argv[]){
     mode_str = std::string(argv[3]);
     if (mode_str == "phxfs") {
         mode = 0;
+    } else if (mode_str == "native") {
+        mode = 2;
     } else {
         mode = 1;
     }
     for (auto i = 0; i < loop_cnt; i++){
         if (mode == 0){
             loop_phxfs_large(&params);
+        } else if (mode == 2) {
+            loop_native_large(&params);
         } else {
             loop_gds_large(&params);
         }
@@ -186,7 +242,7 @@ int main(int argc, char* argv[]){
     }
     total_time /= 1000.0;
     total_io_time /= 1000.0;
-    std::cout << "Test mode: " << (mode == 0 ? "PHXFS" : "GDS") << std::endl;
+    std::cout << "Test mode: " << (mode == 0 ? "PHXFS" : (mode == 2 ? "NATIVE" : "GDS")) << std::endl;
     std::cout << "Total IO operations: " << params.latency_vec.size() << std::endl;
     std::cout << "IO size: " << params.io_size << std::endl;
     std::cout << "Total loop count: " << loop_cnt << std::endl;
