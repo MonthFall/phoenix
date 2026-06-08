@@ -11,11 +11,21 @@ build_root = os.path.join(project_root, "build")
 all_size = [4 ,16 ,64 ,256 ,1024, 4096, 16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024]
 all_thread = [1, 2, 4, 8, 16, 32, 64, 128]
 all_batch = [1, 2, 4, 8, 16, 32, 64, 128, 256]
-file_path = "/home/sc25/p5800/dataset/kvcache_tensor.bin"
-nvmeof_file_path = "/home/sc25/nvme-of/kvcache_tensor.bin"
-model_dir = "/home/sc25/p5800/dataset"
+file_path = "/mnt/nvme4/kvcache_tensor.bin"
+nvmeof_file_path = "/mnt/nvme4/kvcache_tensor.bin"
+model_dir = "/mnt/nvme4/dataset"
+gpu_id = 4
 
 only_get_command = False
+
+SYSTEM_NAMES = {0: "Phoenix", 1: "GDS", 2: "Native POSIX", 3: "Phoenix+stream"}
+
+def print_progress(system, param_name, param_value, result=None):
+    """打印单轮实验进度"""
+    msg = f"  [{system}] {param_name}={param_value}"
+    if result is not None:
+        msg += f" → {result}"
+    print(msg, flush=True)
 
 def exist_path(path):
     return os.path.exists(path)
@@ -39,7 +49,8 @@ def run_fig3():
     result = [[], []]
     for t in [0, 1]:
         for bs in block_size:
-            result[t].append(run_cmd(bin_path, [file_path, t, bs, 10]))
+            print_progress(SYSTEM_NAMES[t], "bs", f"{bs}KB")
+            result[t].append(run_cmd(bin_path, [file_path, t, bs, 10, gpu_id]))
     
     if only_get_command:
         return
@@ -67,7 +78,7 @@ def run_fig3():
     for t in [0, 1]:
         for k, v in patterns[t].items():
             df[k] = parse(result[t], v)
-    df.to_excel("results/fig3.xlsx", index=True, merge_cells=True)
+    df.to_csv(os.path.join(result_dir, "fig3.csv"), index=True)
     
 
 def run_table3():
@@ -78,7 +89,8 @@ def run_table3():
     result = [[], []]
     for t in [0, 1]:
         for bs in block_size:
-            result[t].append(run_cmd(bin_path, [file_path, t, bs, 10]))
+            print_progress(SYSTEM_NAMES[t], "bs", f"{bs}KB")
+            result[t].append(run_cmd(bin_path, [file_path, t, bs, 10, gpu_id]))
 
     if only_get_command:
         return
@@ -104,7 +116,7 @@ def run_table3():
     for t in [0, 1]:
         for k, v in patterns[t].items():
             df[k] = parse(result[t], v)
-    df.to_excel("results/table1.xlsx", index=True, merge_cells=True)
+    df.to_csv(os.path.join(result_dir, "table1.csv"), index=True)
 
 def run_io(args):
     bin_path = os.path.join(build_root, "bin", "microbenchmark")
@@ -112,6 +124,7 @@ def run_io(args):
 
 def run_fig4():
     result = [pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"]), 
+              pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"]),
               pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"])]
 
     block_size = all_size
@@ -121,9 +134,12 @@ def run_fig4():
     
     io_depth = 1
 
-    func_args = lambda xfer_mode, bs: [f"-f {file_path}", "-l 10G", f"-s {bs}", f"-t {thread}", f"-i {io_depth}", f"-m {rw}", f"-a {async_mode}", f"-x {xfer_mode}"]
-    for t in [0, 1]: 
+    func_args = lambda xfer_mode, bs: [f"-f {file_path}", "-l 10G", f"-s {bs}", f"-t {thread}", f"-i {io_depth}", f"-m {rw}", f"-a {async_mode}", f"-x {xfer_mode}", f"-d {gpu_id}"]
+    # t=0: Phoenix(xfer=0), t=2: Native POSIX(xfer=2); GDS(t=1) skipped, result[1] left empty
+    print(f"  [GDS] skipped (not available)", flush=True)
+    for t_idx, t in enumerate([0, 2]): 
         for bs in block_size:
+            print_progress(SYSTEM_NAMES[t], "bs", f"{bs}KB")
             data = run_io(func_args(t, bs * 1024))
             if only_get_command:
                 continue
@@ -136,20 +152,22 @@ def run_fig4():
                     tmp.append(m.group(1))
                 else:
                     print("not match")
-            result[t].loc[len(result[t])] = tmp
+            result[t_idx].loc[len(result[t_idx])] = tmp
+            print_progress(SYSTEM_NAMES[t], "bs", f"{bs}KB", f"bw={tmp[0]} MB/s" if tmp else None)
     if only_get_command:
         return
     
     final_result = pd.concat(result, 
     axis=1,
-    keys=["Phoenix", "NVIDIA GDS"])
+    keys=["Phoenix", "GDS", "Native POSIX"])
     final_result["block size(KB)"] = block_size
     final_result.set_index("block size(KB)", inplace=True)
-    final_result.to_excel("results/fig4.xlsx", index=True, merge_cells=True)
+    final_result.to_csv(os.path.join(result_dir, "fig4.csv"), index=True)
 
 
 def run_fig5():
     result = [pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"]), 
+              pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"]),
               pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"])]
 
     block_size = 4096
@@ -159,13 +177,16 @@ def run_fig5():
     
     io_depth = 1
 
-    func_args = lambda xfer_mode, thread: [f"-f {file_path}", "-l 10G", f"-s {block_size}", f"-t {thread}", f"-i {io_depth}", f"-m {rw}", f"-a {async_mode}", f"-x {xfer_mode}"]
-    for t in [0, 1]: 
+    func_args = lambda xfer_mode, thread: [f"-f {file_path}", "-l 10G", f"-s {block_size}", f"-t {thread}", f"-i {io_depth}", f"-m {rw}", f"-a {async_mode}", f"-x {xfer_mode}", f"-d {gpu_id}"]
+    # t=0: Phoenix(xfer=0), t=2: Native POSIX(xfer=2); GDS(t=1) skipped, result[1] left empty
+    print(f"  [GDS] skipped (not available)", flush=True)
+    for t_idx, t in enumerate([0, 2]): 
         for thread in threads:
+            print_progress(SYSTEM_NAMES[t], "threads", thread)
             data = run_io(func_args(t, thread))
             if only_get_command:
                 continue
-            data = data.split("\n")[11:-1]
+            data = data.split("\n")[-6:-1]
             pattern = r":\s*(\d+?.\d*)\s*"
             tmp = []
             for d in data:
@@ -174,20 +195,22 @@ def run_fig5():
                     tmp.append(m.group(1))
                 else:
                     print("not match")
-            result[t].loc[len(result[t])] = tmp
+            result[t_idx].loc[len(result[t_idx])] = tmp
+            print_progress(SYSTEM_NAMES[t], "threads", thread, f"bw={tmp[0]} MB/s" if tmp else None)
     
     if only_get_command:
         return
     
     final_result = pd.concat(result, 
     axis=1,
-    keys=["Phoenix", "NVIDIA GDS"])
+    keys=["Phoenix", "GDS", "Native POSIX"])
     final_result["threads"] = threads
     final_result.set_index("threads", inplace=True)
-    final_result.to_excel("results/fig5.xlsx", index=True, merge_cells=True)
+    final_result.to_csv(os.path.join(result_dir, "fig5.csv"), index=True)
 
 def run_fig6():
     result = [pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"]), 
+              pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"]),
               pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"]),
               pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"])]
 
@@ -198,13 +221,21 @@ def run_fig6():
     
     io_depth = 16
 
-    func_args = lambda xfer_mode, bs, mode: [f"-f {file_path}", f"-l 20G", f"-s {bs}", f"-t {thread}", f"-i {io_depth}", f"-m {rw}", f"-a {mode}", f"-x {xfer_mode}"]
-    for t in [0, 1, 2]: 
+    func_args = lambda xfer_mode, bs, mode: [f"-f {file_path}", f"-l 20G", f"-s {bs}", f"-t {thread}", f"-i {io_depth}", f"-m {rw}", f"-a {mode}", f"-x {xfer_mode}", f"-d {gpu_id}"]
+    # t=0: Phoenix(async xfer=0), t=2: Native POSIX(async xfer=2), t=3: Phoenix+stream(mode=3)
+    # GDS(t=1) skipped, result[1] left empty
+    print(f"  [GDS] skipped (not available)", flush=True)
+    for t_idx, t in enumerate([0, 2, 3]): 
         for bs in block_size:
-            if t == 2:
+            print_progress(SYSTEM_NAMES[t], "bs", f"{bs}KB")
+            if t == 3:
                 data = run_io(func_args(0, bs * 1024, 3))
+            elif t == 1:
+                data = run_io(func_args(2, bs * 1024, async_mode))
+            elif t == 2:
+                data = run_io(func_args(2, bs * 1024, async_mode))
             else:
-                data = run_io(func_args(t, bs * 1024, async_mode))
+                data = run_io(func_args(0, bs * 1024, async_mode))
             if only_get_command:
                 continue
             data = data.split("\n")[-6:-1]
@@ -216,21 +247,23 @@ def run_fig6():
                     tmp.append(m.group(1))
                 else:
                     print("not match")
-            result[t].loc[len(result[t])] = tmp
+            result[t_idx].loc[len(result[t_idx])] = tmp
+            print_progress(SYSTEM_NAMES[t], "bs", f"{bs}KB", f"bw={tmp[0]} MB/s" if tmp else None)
     
     if only_get_command:
         return
 
     final_result = pd.concat(result, 
     axis=1,
-    keys=["Phoenix", "NVIDIA GDS", "Phoenix with stream"])
+    keys=["Phoenix", "GDS", "Native POSIX", "Phoenix with stream"])
     final_result["block size(KB)"] = block_size
     final_result.set_index("block size(KB)", inplace=True)
-    final_result.to_excel("results/fig6.xlsx", index=True, merge_cells=True)
+    final_result.to_csv(os.path.join(result_dir, "fig6.csv"), index=True)
 
 def run_fig7():
     result = [pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"]), 
-              pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"]),]
+              pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"]),
+              pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"])]
     block_size = 4096
     thread = 1
     rw = "read"
@@ -239,15 +272,17 @@ def run_fig7():
 
     batch_size = all_batch
 
-    func_args = lambda xfer_mode, batch: [f"-f {file_path}", "-l 10G", f"-s {block_size}", f"-t {thread}", f"-i {batch}", f"-m {rw}", f"-a {async_mode}", f"-x {xfer_mode}"]
-    for t in [0, 1]: 
+    func_args = lambda xfer_mode, batch: [f"-f {file_path}", "-l 10G", f"-s {block_size}", f"-t {thread}", f"-i {batch}", f"-m {rw}", f"-a {async_mode}", f"-x {xfer_mode}", f"-d {gpu_id}"]
+    # t=0: Phoenix(xfer=0), t=2: Native POSIX(xfer=2); GDS(t=1) skipped, result[1] left empty
+    print(f"  [GDS] skipped (not available)", flush=True)
+    for t_idx, t in enumerate([0, 2]): 
         for batch in batch_size:
+            print_progress(SYSTEM_NAMES[t], "batch", batch)
             data = run_io(func_args(t, batch))
             if only_get_command:
                 continue
             data = data.split("\n")[-6:-1]
             pattern = r":\s*(\d+?.\d*)\s*"
-            print(data)
             tmp = []
             for d in data:
                 m = re.search(pattern, d)
@@ -255,17 +290,18 @@ def run_fig7():
                     tmp.append(m.group(1))
                 else:
                     print("not match")
-            result[t].loc[len(result[t])] = tmp
+            result[t_idx].loc[len(result[t_idx])] = tmp
+            print_progress(SYSTEM_NAMES[t], "batch", batch, f"bw={tmp[0]} MB/s" if tmp else None)
     
     if only_get_command:
         return
 
     final_result = pd.concat(result, 
     axis=1,
-    keys=["Phoenix", "NVIDIA GDS"])
+    keys=["Phoenix", "GDS", "Native POSIX"])
     final_result["batch size"] = batch_size
     final_result.set_index("batch size", inplace=True)
-    final_result.to_excel("results/fig7.xlsx", index=True, merge_cells=True)
+    final_result.to_csv(os.path.join(result_dir, "fig7.csv"), index=True)
 
 def run_fig8():
     Log.info("Small size result")
@@ -308,6 +344,7 @@ def run_fig9():
 
 def run_fig10():
     result = [pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"]), 
+              pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"]),
               pd.DataFrame(columns=["bandwidth(MB/s)", "latency(us)", "P95(us)", "P99(us)", "P99.9(us)"])]
 
     block_size = 4096
@@ -316,13 +353,16 @@ def run_fig10():
     async_mode = 0
     io_depth = 1
 
-    func_args = lambda xfer_mode, thread: [f"-f {nvmeof_file_path}", "-l 10G", f"-s {block_size}", f"-t {thread}", f"-i {io_depth}", f"-m {rw}", f"-a {async_mode}", f"-x {xfer_mode}"]
-    for t in [0, 1]: 
+    func_args = lambda xfer_mode, thread: [f"-f {nvmeof_file_path}", "-l 10G", f"-s {block_size}", f"-t {thread}", f"-i {io_depth}", f"-m {rw}", f"-a {async_mode}", f"-x {xfer_mode}", f"-d {gpu_id}"]
+    # t=0: Phoenix(xfer=0), t=2: Native POSIX(xfer=2); GDS(t=1) skipped, result[1] left empty
+    print(f"  [GDS] skipped (not available)", flush=True)
+    for t_idx, t in enumerate([0, 2]): 
         for thread in threads:
+            print_progress(SYSTEM_NAMES[t], "threads", thread)
             data = run_io(func_args(t, thread))
             if only_get_command:
                 continue
-            data = data.split("\n")[11:-1]
+            data = data.split("\n")[-6:-1]
             pattern = r":\s*(\d+?.\d*)\s*"
             tmp = []
             for d in data:
@@ -331,17 +371,18 @@ def run_fig10():
                     tmp.append(m.group(1))
                 else:
                     print("not match")
-            result[t].loc[len(result[t])] = tmp
+            result[t_idx].loc[len(result[t_idx])] = tmp
+            print_progress(SYSTEM_NAMES[t], "threads", thread, f"bw={tmp[0]} MB/s" if tmp else None)
     
     if only_get_command:
         return
 
     final_result = pd.concat(result, 
     axis=1,
-    keys=["Phoenix", "NVIDIA GDS"])
+    keys=["Phoenix", "GDS", "Native POSIX"])
     final_result["threads"] = threads
     final_result.set_index("threads", inplace=True)
-    final_result.to_excel("results/fig10.xlsx", index=True, merge_cells=True)
+    final_result.to_csv(os.path.join(result_dir, "fig10.csv"), index=True)
 
 
 
@@ -351,38 +392,43 @@ def run_fig11():
     
     traces_path = os.path.join(project_root, "benchmarks/kvcache/traces")
     
-    result = [pd.DataFrame(columns=trace_text), pd.DataFrame(columns=trace_text)]
+    result = [pd.DataFrame(columns=trace_text), pd.DataFrame(columns=trace_text), pd.DataFrame(columns=trace_text)]
 
     block_size = [8192, 16384, 65536]
+    # t=0: Phoenix(phxfs), t=2: Native POSIX(native); GDS(t=1) skipped, result[1] left empty
+    print(f"  [GDS] skipped (not available)", flush=True)
     for trace in trace_text:
-        for t in [0, 1]:
+        for t_idx, t in enumerate([0, 2]):
             trace_result = []
             for b in block_size:
-                data = run_cmd(bin_path, ["phxfs" if t == 0 else "gds", 0, os.path.join(traces_path, trace), b, file_path])
+                print_progress(SYSTEM_NAMES[t], f"trace={trace}, bs", f"{b}KB")
+                data = run_cmd(bin_path, ["phxfs" if t == 0 else "native", gpu_id, os.path.join(traces_path, trace), b, file_path])
                 if only_get_command:
                     continue
                 pattern = r"IO Bandwidth:\s*(\d+?.\d*)\s*GB/s"
                 m = re.search(pattern, data)
                 if m:
                     trace_result.append(m.group(1))
+                    print_progress(SYSTEM_NAMES[t], f"trace={trace}, bs", f"{b}KB", f"bw={m.group(1)} GB/s")
                 else:
                     Log.error("not match")
                     exit(-1)
-            result[t][trace] = trace_result
+            result[t_idx][trace] = trace_result
     if only_get_command:
         return
     final_result = pd.concat(result, 
     axis=1,
-    keys=["Phoenix", "NVIDIA GDS"])
+    keys=["Phoenix", "GDS", "Native POSIX"])
     final_result["block size"] = block_size
     final_result.set_index("block size", inplace=True)
-    final_result.to_excel("results/fig11.xlsx", index=True, merge_cells=True)
+    final_result.to_csv(os.path.join(result_dir, "fig11.csv"), index=True)
 
 def run_fig12():
-    model_list = {"facebook": [
-                     "opt-2.7b_safetensors_0", "opt-6.7b_safetensors_0", "opt-13b_safetensors_0"],
-                "llama": [
-                        "Meta-Llama-3-8B"],
+    model_list = {
+                # "facebook": [
+                #     "opt-2.7b_safetensors_0", "opt-6.7b_safetensors_0", "opt-13b_safetensors_0"],
+                # "llama": [
+                #         "Meta-Llama-3-8B"],
                 "tiiuae": [
                         "falcon-7b", "falcon-11B"],
                 "qwen" : [
@@ -400,24 +446,35 @@ def run_fig12():
 
     result = pd.DataFrame()
 
+    # Count total models for filling GDS empty column
+    total_models = sum(len(model_list[m]) for m in model_list)
+
     for name, benchmark in benchmark_type.items():
         cur_result = []
+        if name == "gds":
+            # GDS not available, fill with empty strings
+            print(f"  [GDS] skipped (not available)", flush=True)
+            cur_result = [""] * total_models
+            result[name] = cur_result
+            continue
         for model in model_list:
             for model_name in model_list[model]:
                 model_path = os.path.join(model_dir, model, model_name)
+                print_progress(name, "model", model_name)
                 # subprocess.run("echo 3 | sudo tee /proc/sys/vm/drop_caches", shell=True)
                 if os.path.exists(bin_path) and os.path.exists(model_path):
-                    data = run_cmd(bin_path, [model_path, benchmark, 0])
+                    data = run_cmd(bin_path, [model_path, benchmark, gpu_id])
                     if only_get_command:
                         continue
                     numbers = re.findall(pattern, data)
                     cur_result.append(numbers[0])
+                    print_progress(name, "model", model_name, f"elapsed={numbers[0]}s" if numbers else None)
                 else:
                     print(f"Binary {bin_path} or model path {model_path} does not exist")
         result[name] = cur_result
     if only_get_command:
         return
-    result.to_excel("results/fig12.xlsx", index=True, merge_cells=True)
+    result.to_csv(os.path.join(result_dir, "fig12.csv"), index=True)
 
 def parser():
     parser = argparse.ArgumentParser()
