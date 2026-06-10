@@ -483,18 +483,33 @@ def parser():
     artifacts.append("all")
     parser.add_argument("-g", "--get_commands", action="store_true", help="get the artifact command")
     parser.add_argument("-a", "--artifact", help="Artifact to reproduce", required=True, choices=artifacts)
+    parser.add_argument("--file-path", default=file_path,
+                        help="IO test file path (default: %(default)s)")
+    parser.add_argument("--nvmeof-file-path", default=nvmeof_file_path,
+                        help="NVMe-oF test file path (default: %(default)s)")
+    parser.add_argument("--model-dir", default=model_dir,
+                        help="Model directory for safetensor benchmark (default: %(default)s)")
+    parser.add_argument("--gpu-id", type=int, default=gpu_id,
+                        help="GPU device ID (default: %(default)s)")
+    parser.add_argument("--result-dir", default=None,
+                        help="Output directory for CSV results (default: <project_root>/sc25/results)")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    result_dir = os.path.join(project_root, "sc25/results")
+    args = parser()
+    file_path = args.file_path
+    nvmeof_file_path = args.nvmeof_file_path
+    model_dir = args.model_dir
+    gpu_id = args.gpu_id
+    result_dir = args.result_dir if args.result_dir else os.path.join(project_root, "sc25/results")
+
     if not os.path.exists(result_dir):
         os.mkdir(result_dir)
 
-    args = parser()
     if args.get_commands:
         only_get_command = True
-    
+
     if args.artifact == "all":
         run_table3()
         for i in range(3, 13):
