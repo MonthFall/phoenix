@@ -30,6 +30,9 @@ void *phxfs_bar_offset_to_va(struct phxfs_dev *dev, u64 bar_offset)
 	int lo, hi, mid;
 	u64 phys_addr;
 
+	if (!dev)
+		return NULL;
+
 	/* Legacy single-segment path */
 	if (!dev->segments || dev->num_segments <= 0) {
 		if (dev->pci_mem_va && bar_offset < dev->size)
@@ -63,6 +66,9 @@ void *phxfs_bar_offset_to_va(struct phxfs_dev *dev, u64 bar_offset)
 
 void unmap_and_release(struct p2p_vmap* map)
 {
+    if (!map)
+        return;
+
     if (map->release != NULL && map->data != NULL)
     {
         map->release(map);
@@ -75,7 +81,12 @@ void unmap_and_release(struct p2p_vmap* map)
 
 void release_gpu_memory(struct p2p_vmap* map)
 {
-    struct gpu_region* gd = (struct gpu_region*) map->data;
+    struct gpu_region* gd;
+
+    if (!map)
+        return;
+
+    gd = (struct gpu_region*) map->data;
     if (gd != NULL)
     {
         if (gd->pages != NULL)
@@ -95,7 +106,12 @@ void release_gpu_memory(struct p2p_vmap* map)
 
 static void force_release_gpu_memory(struct p2p_vmap* map)
 {
-    struct gpu_region* gd = (struct gpu_region*) map->data;
+    struct gpu_region* gd;
+
+    if (WARN_ON(!map))
+        return;
+
+    gd = (struct gpu_region*) map->data;
 
 
     if (gd != NULL)
@@ -164,6 +180,9 @@ int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_l
     unsigned long total_pages;
     unsigned long k;
     int ret, i, j;
+
+    if (!mbuffer)
+        return -EINVAL;
 
     vma = mbuffer->vma;
     page_size = GPU_PAGE_SIZE;
@@ -321,6 +340,9 @@ void phxfs_map_dev_release(phxfs_ioctl_map_t *map_param, u64 devaddr, u64 dev_le
 }
 
 static void phxfs_mbuffer_free(phxfs_mmap_buffer_t mbuffer) {
+    if (WARN_ON(!mbuffer))
+        return;
+
     spin_lock(&lock);
     hash_del_rcu(&mbuffer->hash_link);
     spin_unlock(&lock);
@@ -348,10 +370,14 @@ void phxfs_mbuffer_init(void) {
 
 
 void phxfs_mbuffer_get_ref(phxfs_mmap_buffer_t mbuffer) {
+    if (WARN_ON(!mbuffer))
+        return;
     atomic_inc(&mbuffer->ref);
 }
 
 bool phxfs_mbuffer_put_ref(phxfs_mmap_buffer_t mbuffer) {
+    if (WARN_ON(!mbuffer))
+        return true;
     return atomic_dec_and_test(&mbuffer->ref);
 }
 
@@ -402,6 +428,9 @@ int phxfs_add_phony_buffer(struct file *filp, struct vm_area_struct *vma) {
     unsigned long base_index;
     struct phxfs_dev *dev;
     phxfs_mmap_buffer_t phxfs_mbuffer, phxfs_new_mbuffer;
+
+    if (WARN_ON(!filp || !vma))
+        return -EINVAL;
 
     buffer_len = vma->vm_end - vma->vm_start;
 

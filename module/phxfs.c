@@ -172,6 +172,10 @@ static int phxfs_compute_bar_segments(
 	bool *block_skip; /* true = has PAT conflict, skip this block */
 	struct phxfs_bar_segment *segs;
 
+	if (n_conflicts < 0) {
+		return -EINVAL;
+	}
+
 	usable_start = paddr + PHXFS_RESERVED_SIZE;
 	usable_end = paddr + hbm_size - PHXFS_RESERVED_SIZE;
 
@@ -289,6 +293,9 @@ static int phxfs_devm_memremap(struct phxfs_dev *phx_dev) {
 	struct phxfs_bar_segment *segs = NULL;
 	int n_conflicts, n_segments;
 	int i, ret = 1;
+
+	if (!phx_dev)
+		return -EINVAL;
 
 	phxfs_info("phxfs%d: BAR size=%llu MiB, paddr=0x%llx\n",
 	       phx_dev->idx, phx_dev->size / (1024 * 1024), phx_dev->paddr);
@@ -494,6 +501,10 @@ static int phxfs_ctrl_init(struct phxfs_ctrl *dev_ctrl, u32 dev_num) {
 	int i, j, ret;
 	u64 size;
 	u16 bus, fn;
+
+	if (!dev_ctrl)
+		return -EINVAL;
+
 	dev_ctrl->dev_num = dev_num;
 	for (i = 0; i < dev_ctrl->dev_num; i++) {
 		bus = (gpu_info_table[i] >> 8) & 0xFF;
@@ -529,6 +540,10 @@ static int phxfs_open(struct inode *inode, struct file *filp) {
 	int ret = 0;
 	int dev_idx;
 	char *file_name;
+
+	if (WARN_ON(!filp))
+		return -EINVAL;
+
 	file_name = filp->f_path.dentry->d_iname; 
 
 	if (file_name != NULL) {
@@ -581,7 +596,12 @@ static const struct file_operations phxfs_chr_fops = {
 
 static ssize_t pci_bdf_show(struct device *cdev_device,
                             struct device_attribute *attr, char *buf) {
-	struct phxfs_dev *phxdev = dev_get_drvdata(cdev_device);
+	struct phxfs_dev *phxdev;
+
+	if (WARN_ON(!cdev_device || !buf))
+		return -ENODEV;
+
+	phxdev = dev_get_drvdata(cdev_device);
 	if (phxdev == NULL || phxdev->dev == NULL)
 		return -ENODEV;
 	return sprintf(buf, "%04x:%02x:%02x.%x\n",
@@ -594,6 +614,9 @@ static DEVICE_ATTR_RO(pci_bdf);
 
 void phxfs_cdev_del(struct cdev *cdev, struct device *cdev_device,
                     struct phxfs_dev *dev) {
+	if (WARN_ON(!cdev || !cdev_device || !dev))
+		return;
+
 	device_remove_file(cdev_device, &dev_attr_pci_bdf);
 	cdev_device_del(cdev, cdev_device);
 	if (dev->remap) {
@@ -660,6 +683,10 @@ int phxfs_cdev_add(struct cdev *cdev, struct device *cdev_device,
 int phxfs_cdev_init(struct phxfs_ctrl *ctrl) {
 	int ret = -ENOMEM;
 	int i;
+
+	if (!ctrl)
+		return -EINVAL;
+
 	ret = alloc_chrdev_region(&phxfs_chr_devt, 0, ctrl->dev_num,
 								"phxfs-generic");
 	if (ret < 0)
