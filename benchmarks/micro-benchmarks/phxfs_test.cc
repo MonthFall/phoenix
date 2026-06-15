@@ -16,8 +16,6 @@
 // todo: time of async single I/O  
 static void *async_thread(void *arg) {
     struct timespec io_start, io_end;
-    struct io_uring_sqe *sqe;
-    struct io_uring_cqe *cqe;
     phxfs_xfer_addr *xfer_addr = NULL;
     ThreadData *data = (ThreadData *)arg;
     phxfs_fileid_t fid = (phxfs_fileid_t){
@@ -26,15 +24,12 @@ static void *async_thread(void *arg) {
     };
     uint64_t io_time;
     size_t done_bytes = 0;
-    size_t i, j, pending;
+    size_t i, j;
     size_t internal_bytes = 0;
-    ssize_t io_size = (ssize_t)data->io_size;
-    unsigned nr_completed = 0;
     unsigned long long chunk_size = data->size / data->depth;
     unsigned long long chunk_done_size = 0;
 
-    int ret;
-    int op = data->mode == 0 ? IORING_OP_READ : IORING_OP_WRITE;
+    ssize_t pread_ret;
 
     int repeated = data->size / data->io_size / data->depth;
     if (repeated < 30){
@@ -56,11 +51,6 @@ static void *async_thread(void *arg) {
         }
         clock_gettime(CLOCK_MONOTONIC, &io_start);
         for (i = 0 ; i < data->depth; i++){
-            sqe = io_uring_get_sqe(data->ring);
-            if (!sqe) {
-                pr_error("io_uring_get_sqe failed");
-                return NULL;
-            }
             // 针对GPU地址进行转换
             xfer_addr = phxfs_do_xfer_addr(fid.deviceID, data->gpu_buffer,
                                         chunk_done_size + i * data->io_size,
@@ -71,10 +61,22 @@ static void *async_thread(void *arg) {
             }
             internal_bytes = 0;
             for (j = 0; j < xfer_addr->nr_xfer_addrs; j++){
-                io_uring_prep_rw(op, sqe, fid.fd,
-                                 xfer_addr->x_addrs[j].target_addr,
-                                 xfer_addr->x_addrs[j].nbyte,
-                                 data->offset + done_bytes + internal_bytes);
+                if (data->mode == 0)
+                    pread_ret = pread(fid.fd,
+                                     xfer_addr->x_addrs[j].target_addr,
+                                     xfer_addr->x_addrs[j].nbyte,
+                                     data->offset + done_bytes + internal_bytes);
+                else
+                    pread_ret = pwrite(fid.fd,
+                                      xfer_addr->x_addrs[j].target_addr,
+                                      xfer_addr->x_addrs[j].nbyte,
+                                      data->offset + done_bytes + internal_bytes);
+                if (pread_ret != (ssize_t)xfer_addr->x_addrs[j].nbyte){
+                    pr_error("pread/pwrite failed: ret=" << pread_ret
+                        << " expected=" << xfer_addr->x_addrs[j].nbyte
+                        << " offset=" << data->offset + done_bytes + internal_bytes);
+                    return NULL;
+                }
                 internal_bytes += xfer_addr->x_addrs[j].nbyte;
                 if (j > 0)
                     pr_info("request split!");
@@ -83,23 +85,10 @@ static void *async_thread(void *arg) {
             if (internal_bytes != data->io_size){
                 pr_error("phxfs_xfer_addr faild");
             }
-            io_uring_submit(data->ring);
-        }
-        pending = i;
-        nr_completed = 0;
-        while (nr_completed != pending){
-            ret = io_uring_wait_cqe(data->ring, &cqe);
-            if (ret < 0 || cqe->res != io_size){ 
-                pr_error("io_uring_wait_cqes failed");
-                return NULL;
-            }
-            io_uring_cqe_seen(data->ring, cqe);
-            nr_completed ++;
         }
         chunk_done_size += data->io_size;
-        nr_completed = 0;
         clock_gettime(CLOCK_MONOTONIC, &io_end);
-        done_bytes += data->io_size * pending;
+        done_bytes += data->io_size * data->depth;
         io_time = (io_end.tv_sec - io_start.tv_sec) * 1000000000LL + (io_end.tv_nsec - io_start.tv_nsec);
         data->io_operations ++;
         data->total_io_time += io_time;
@@ -201,8 +190,6 @@ static void *async_thread_stream(void *arg) {
 
 static void *batch_thread(void *arg) {
     struct timespec io_start, io_end;
-    struct io_uring_sqe *sqe;
-    struct io_uring_cqe *cqe;
     phxfs_xfer_addr *xfer_addr = NULL;
     ThreadData *data = (ThreadData *)arg;
     phxfs_fileid_t fid = (phxfs_fileid_t){
@@ -211,32 +198,24 @@ static void *batch_thread(void *arg) {
     };
     uint64_t io_time;
     size_t done_bytes = 0;
-    size_t i, j, pending;
+    size_t i, j, count;
     size_t internal_bytes = 0;
-    ssize_t io_size = (ssize_t)data->io_size;
-    unsigned nr_completed = 0;
 
     unsigned long long chuck_size = data->size / data->depth;
     unsigned long long chuck_done_size = 0;
 
-    
-    int ret;
-    int op = data->mode == 0 ? IORING_OP_READ : IORING_OP_WRITE;
+    ssize_t pread_ret;
 
     pr_info(__func__);
     
     while (done_bytes < data->size) {
         
         clock_gettime(CLOCK_MONOTONIC, &io_start);
+        count = 0;
         for (i = 0 ; i < data->depth; i++){
             if (chuck_done_size + (ssize_t)data->io_size  > chuck_size){
                 pr_debug("out of range");
                 break;
-            }
-            sqe = io_uring_get_sqe(data->ring);
-            if (!sqe) {
-                pr_error("io_uring_get_sqe failed");
-                return NULL;
             }
             // 针对GPU地址进行转换
             xfer_addr = phxfs_do_xfer_addr(fid.deviceID, data->gpu_buffer,
@@ -245,10 +224,22 @@ static void *batch_thread(void *arg) {
             internal_bytes = 0;
             for (j = 0; j < xfer_addr->nr_xfer_addrs; j++){
                 // 一般情况下不会超过两个，但是长度可能会跨mmap的1G边界
-                io_uring_prep_rw(op, sqe, fid.fd,
-                                 xfer_addr->x_addrs[j].target_addr,
-                                 xfer_addr->x_addrs[j].nbyte,
-                                 data->offset + done_bytes + internal_bytes);
+                if (data->mode == 0)
+                    pread_ret = pread(fid.fd,
+                                     xfer_addr->x_addrs[j].target_addr,
+                                     xfer_addr->x_addrs[j].nbyte,
+                                     data->offset + done_bytes + internal_bytes);
+                else
+                    pread_ret = pwrite(fid.fd,
+                                      xfer_addr->x_addrs[j].target_addr,
+                                      xfer_addr->x_addrs[j].nbyte,
+                                      data->offset + done_bytes + internal_bytes);
+                if (pread_ret != (ssize_t)xfer_addr->x_addrs[j].nbyte){
+                    pr_error("pread/pwrite failed: ret=" << pread_ret
+                        << " expected=" << xfer_addr->x_addrs[j].nbyte
+                        << " offset=" << data->offset + done_bytes + internal_bytes);
+                    return NULL;
+                }
                 internal_bytes += xfer_addr->x_addrs[j].nbyte;
                 if (j > 0)
                     pr_info("request split!");
@@ -257,23 +248,11 @@ static void *batch_thread(void *arg) {
             if (internal_bytes != data->io_size){
                 pr_error("phxfs_xfer_addr faild");
             }
-        }
-        pending = i;
-        io_uring_submit(data->ring);
-        nr_completed = 0;
-        while (nr_completed != pending){
-            ret = io_uring_wait_cqe(data->ring, &cqe);
-            if (ret < 0 || cqe->res != io_size){ 
-                pr_error("io_uring_wait_cqes failed");
-                return NULL;
-            }
-            io_uring_cqe_seen(data->ring, cqe);
-            nr_completed ++;
+            count++;
         }
         chuck_done_size += data->io_size;
-        nr_completed = 0;
         clock_gettime(CLOCK_MONOTONIC, &io_end);
-        done_bytes += data->io_size * pending;
+        done_bytes += data->io_size * count;
         io_time = (io_end.tv_sec - io_start.tv_sec) * 1000000000LL + (io_end.tv_nsec - io_start.tv_nsec);
         data->io_operations ++;
         data->total_io_time += io_time;
@@ -402,7 +381,18 @@ int run_phxfs(GDSOpts opts){
 
     check_cudaruntimecall(cudaSetDevice(device));
 
-    ret = phxfs_open(opts.gpu_id);
+    // Auto-detect phxfs_device_id if not specified (-1)
+    int phxfs_dev_id = opts.phxfs_device_id;
+    if (phxfs_dev_id < 0) {
+        phxfs_dev_id = phxfs_find_dev_for_cuda_gpu(opts.gpu_id);
+        if (phxfs_dev_id < 0) {
+            pr_error("phxfs_find_dev_for_cuda_gpu failed for GPU " << opts.gpu_id);
+            return 1;
+        }
+    }
+    pr_info("Phxfs Device ID: " << phxfs_dev_id);
+
+    ret = phxfs_open(phxfs_dev_id);
 
     if (ret != 0) {
         pr_error("phxfs init failed: " << ret);
@@ -411,7 +401,7 @@ int run_phxfs(GDSOpts opts){
 
     fid = (phxfs_fileid_t){
         .fd = file_fd,
-        .deviceID = opts.gpu_id
+        .deviceID = phxfs_dev_id
     };
 
     chunk_size = opts.length / opts.num_threads;
@@ -423,7 +413,7 @@ int run_phxfs(GDSOpts opts){
         data->buffer = NULL;
         data->total_io_time = 0;
         data->io_operations = 0;
-        data->device_id = opts.gpu_id;
+        data->device_id = phxfs_dev_id;
         data->io_size = opts.io_size;
         data->depth = opts.io_depth;
         data->fd = file_fd;
@@ -443,28 +433,7 @@ int run_phxfs(GDSOpts opts){
         }
 
 
-        if (opts.async != 0){
-            data->ring = new io_uring();
-            struct io_uring_params params; 
-            memset(&params, 0, sizeof(params));
-            params.flags = 0 ;
-            params.cq_entries = params.sq_entries = data->depth;
-            ret = io_uring_queue_init_params(data->depth, data->ring, &params);
-            
-            if (ret) {
-                pr_error("io_uring_queue_init failed: " << ret);
-                return 1;
-            }
-
-            ret = io_uring_register_files(data->ring, &fid.fd, 1);
-            
-            if (ret < 0 ){
-                pr_error("io_uring_register_files fail , ret is" << ret);
-                return 1;
-            }
-        }else{
-            data->ring = NULL;
-        }
+        data->ring = NULL;
 
 
         data->latency_vec.reserve(data->size / data->io_size + 10);
