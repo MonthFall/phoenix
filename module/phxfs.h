@@ -8,8 +8,34 @@
 #include <linux/genalloc.h>
 #include <linux/cdev.h>
 #include <linux/pci.h>
+#include <linux/printk.h>
 
 #define MAX_DEV_NUM 16
+
+/* Phoenix logging macros */
+extern int phxfs_debug;
+
+#define phxfs_info(fmt, ...)					\
+	do {							\
+		if (phxfs_debug)				\
+			printk(KERN_INFO fmt, ##__VA_ARGS__);	\
+	} while (0)
+
+#define phxfs_warn(fmt, ...)					\
+	printk(KERN_WARNING fmt, ##__VA_ARGS__)
+
+#define phxfs_err(fmt, ...)					\
+	printk(KERN_ERR fmt, ##__VA_ARGS__)
+
+#define PHXFS_REMAP_UNIT_SIZE  ((u64)16 * 1024 * 1024)  /* 16 MiB per remap unit */
+#define PHXFS_RESERVED_SIZE    ((u64)128 * 1024 * 1024)  /* 128 MiB reserved at head/tail */
+
+struct phxfs_bar_segment {
+	u64 phys_start;    /* physical start address of this segment */
+	u64 size;          /* segment size (multiple of PHXFS_REMAP_UNIT_SIZE) */
+	void *va;          /* virtual address from devm_memremap_pages */
+	struct pci_p2pdma_pagemap *p2p_pgmap;
+};
 
 struct pci_p2pdma {
     struct gen_pool *pool;
@@ -30,14 +56,17 @@ struct phxfs_dev {
     unsigned int devfn;
     u64 size; /* HBM pci bar 4 size */
     u64 paddr; /* HBM bus address space addr */
+    struct resource pgmap_res;
     struct device device; /* char device. */
     struct cdev cdev;
     int idx;
-    struct pci_p2pdma_pagemap *p2p_pgmap; /* struct dev_pagemap pgmap; */
+    struct pci_p2pdma_pagemap *p2p_pgmap; /* legacy single-segment pgmap (kept for compat) */
     void *dev_remap_addr;
-    void __iomem *pci_mem_va; /* get from devm_memremap_pages */
+    void __iomem *pci_mem_va; /* legacy single-segment VA (kept for compat) */
     bool remap;
     unsigned int dev_page_size;
+    struct phxfs_bar_segment *segments; /* dynamically allocated segment array */
+    int num_segments;    /* number of successfully mapped segments */
 };
 
 struct phxfs_ctrl {

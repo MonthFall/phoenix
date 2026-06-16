@@ -35,7 +35,7 @@ static inline void loop_gds_large(struct IOParams *params){
         printf("open file failed\n");
         exit(1);
     }
-    check_cudaruntimecall(cudaSetDevice(0));
+    check_cudaruntimecall(cudaSetDevice(params->device_id));
 
     check_cudaruntimecall(cudaMalloc(&gpu_buffer, params->io_size));
     check_cudaruntimecall(cudaMemset(gpu_buffer, 0xab, params->io_size));
@@ -91,7 +91,12 @@ static inline void loop_phxfs_large(struct IOParams *params){
     struct timespec start, end;
     struct timespec io_start, io_end;
     int file_fd;
-    int device_id = 0;
+    int device_id = params->device_id;
+    int phxfs_dev_id = phxfs_find_dev_for_cuda_gpu(device_id);
+    if (phxfs_dev_id < 0) {
+        printf("phxfs_find_dev_for_cuda_gpu failed for GPU %d\n", device_id);
+        exit(1);
+    }
     void *gpu_buffer;
     void *target_addr;
     int ret;
@@ -109,13 +114,13 @@ static inline void loop_phxfs_large(struct IOParams *params){
     check_cudaruntimecall(cudaStreamSynchronize(0));
 
     clock_gettime(CLOCK_MONOTONIC, &start);
-    ret = phxfs_open(0);
+    ret = phxfs_open(phxfs_dev_id);
     if (ret){
         printf("phxfs open failed\n");
         exit(1);
     }
     
-    ret = phxfs_regmem(device_id, gpu_buffer, params->io_size, &target_addr);
+    ret = phxfs_regmem(phxfs_dev_id, gpu_buffer, params->io_size, &target_addr);
 
     if (ret){
         printf("phxfs regmem failed\n");
@@ -123,20 +128,20 @@ static inline void loop_phxfs_large(struct IOParams *params){
     }
 
     clock_gettime(CLOCK_MONOTONIC, &io_start);
-    result = phxfs_read({.fd = file_fd, .deviceID = device_id}, gpu_buffer, 0, params->io_size, params->loop_idx * params->io_size);
+    result = phxfs_read({.fd = file_fd, .deviceID = phxfs_dev_id}, gpu_buffer, 0, params->io_size, params->loop_idx * params->io_size);
     if (result != params->io_size){
         printf("phxfs read failed\n");
         exit(1);
     }
     clock_gettime(CLOCK_MONOTONIC, &io_end);
 
-    ret = phxfs_deregmem(device_id, gpu_buffer, params->io_size);
+    ret = phxfs_deregmem(phxfs_dev_id, gpu_buffer, params->io_size);
     if (ret){
         printf("phxfs unregmem failed\n");
         exit(1);
     }
 
-    phxfs_close(device_id);
+    phxfs_close(phxfs_dev_id);
     clock_gettime(CLOCK_MONOTONIC, &end);
     close(file_fd);
     check_cudaruntimecall(cudaFree(gpu_buffer));
@@ -147,10 +152,62 @@ static inline void loop_phxfs_large(struct IOParams *params){
 
 }
 
+static inline void loop_native_large(struct IOParams *params){
+    struct timespec start, end;
+    struct timespec io_start, io_end;
+    int file_fd;
+    int device_id = params->device_id;
+    void *gpu_buffer;
+    void *cpu_buffer;
+    ssize_t result;
+    
+    check_cudaruntimecall(cudaSetDevice(device_id));
+    file_fd = open(params->file_path.c_str(), O_RDWR | O_CREAT | O_DIRECT, 0664);
+    if (file_fd < 0){
+        printf("open file failed\n");
+        exit(1);
+    }
+
+    check_cudaruntimecall(cudaMalloc(&gpu_buffer, params->io_size));
+    int ret = posix_memalign(&cpu_buffer, 4096, params->io_size);
+    if (ret != 0){
+        printf("cpu buffer alloc failed\n");
+        exit(1);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    clock_gettime(CLOCK_MONOTONIC, &io_start);
+    {
+        ssize_t total_read = 0;
+        while (total_read < (ssize_t)params->io_size) {
+            result = pread(file_fd, (char *)cpu_buffer + total_read,
+                           params->io_size - total_read,
+                           params->loop_idx * params->io_size + total_read);
+            if (result <= 0) {
+                printf("native pread failed: %zd (total_read=%zd)\n", result, total_read);
+                exit(1);
+            }
+            total_read += result;
+        }
+    }
+    check_cudaruntimecall(cudaMemcpy(gpu_buffer, cpu_buffer, params->io_size, cudaMemcpyHostToDevice));
+    check_cudaruntimecall(cudaStreamSynchronize(0));
+    clock_gettime(CLOCK_MONOTONIC, &io_end);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    free(cpu_buffer);
+    check_cudaruntimecall(cudaFree(gpu_buffer));
+    close(file_fd);
+    unsigned long long total_time = (end.tv_sec - start.tv_sec) * 1000000000 + (end.tv_nsec - start.tv_nsec);
+    unsigned long long io_time = (io_end.tv_sec - io_start.tv_sec) * 1000000000 + (io_end.tv_nsec - io_start.tv_nsec);
+    params->io_latency_vec.push_back(io_time);
+    params->latency_vec.push_back(total_time);
+}
+
 static ssize_t loop_cnt = 10;
 int main(int argc, char* argv[]){
-    if (argc != 4){
-        printf("Usage: %s <file_path> <io_size> <mode>\n", argv[0]);
+    if (argc != 5){
+        printf("Usage: %s <file_path> <io_size> <mode> <gpu_id>\n", argv[0]);
         return -1;
     }
     int mode;
@@ -159,15 +216,20 @@ int main(int argc, char* argv[]){
     params.file_path = argv[1];
     params.io_size = atoll(argv[2]);
     params.loop_idx = 0;
+    params.device_id = atoi(argv[4]);
     mode_str = std::string(argv[3]);
     if (mode_str == "phxfs") {
         mode = 0;
+    } else if (mode_str == "native") {
+        mode = 2;
     } else {
         mode = 1;
     }
     for (auto i = 0; i < loop_cnt; i++){
         if (mode == 0){
             loop_phxfs_large(&params);
+        } else if (mode == 2) {
+            loop_native_large(&params);
         } else {
             loop_gds_large(&params);
         }
@@ -180,7 +242,7 @@ int main(int argc, char* argv[]){
     }
     total_time /= 1000.0;
     total_io_time /= 1000.0;
-    std::cout << "Test mode: " << (mode == 0 ? "PHXFS" : "GDS") << std::endl;
+    std::cout << "Test mode: " << (mode == 0 ? "PHXFS" : (mode == 2 ? "NATIVE" : "GDS")) << std::endl;
     std::cout << "Total IO operations: " << params.latency_vec.size() << std::endl;
     std::cout << "IO size: " << params.io_size << std::endl;
     std::cout << "Total loop count: " << loop_cnt << std::endl;

@@ -95,7 +95,12 @@ int run_posix(GDSOpts opts){
     std::vector<uint64_t> latency_vec;
 
 
-    static void *(*rw_funcs[2][2])(void *arg) = {{read_thread, write_thread}, {NULL, NULL}};
+    static void *(*rw_funcs[4][2])(void *arg) = {
+        {read_thread, write_thread}, 
+        {read_thread, write_thread}, 
+        {read_thread, write_thread},
+        {NULL, NULL}
+    };
 
 
     threads = new GDSThread[opts.num_threads];
@@ -138,10 +143,6 @@ int run_posix(GDSOpts opts){
             goto out;
         }
 
-        if (opts.async > 0){
-            goto out;
-        }
-
     }
     clock_gettime(CLOCK_MONOTONIC, &prog_start);
     for (int i = 0; i < opts.num_threads; i++) {
@@ -162,7 +163,7 @@ int run_posix(GDSOpts opts){
         latency_vec.insert(latency_vec.end(), threads[i].data.latency_vec.begin(), threads[i].data.latency_vec.end());
     }
     pr_info("Total IO operations: " << total_io_operations);
-    average_io_bandwidth = (((double)total_io_operations * opts.io_size * opts.io_depth)/(MB) ) / (1.0 * prog_time / 1000000000.0);
+    average_io_bandwidth = (((double)total_io_operations * opts.io_size)/(MB) ) / (1.0 * prog_time / 1000000000.0);
     pr_info("Average IO bandwidth: " << average_io_bandwidth << " MB/s");
     average_io_latency = (double)total_io_time / (total_io_operations * 1000.0);
     pr_info("Average IO latency: " << average_io_latency << " us");
