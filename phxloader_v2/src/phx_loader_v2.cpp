@@ -1,0 +1,190 @@
+#include "phx_loader_v2.h"
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
+#include <stdexcept>
+#include <system_error>
+
+// phoenix C API header
+#include <phoenix.h>
+
+namespace {
+
+constexpr size_t PAGE_SIZE = 4096;
+constexpr size_t GPU_PAGE_SIZE = 64 * 1024;  // HUGE_PAGE_SIZE in phoenix
+
+inline size_t align_up(size_t val, size_t alignment) {
+    return (val + alignment - 1) & ~(alignment - 1);
+}
+
+}  // namespace
+
+PhxLoaderV2::PhxLoaderV2(int cuda_device_id)
+    : cuda_device_(cuda_device_id), initialized_(false) {
+    dev_ = phxfs_find_dev_for_cuda_gpu(cuda_device_id);
+    if (dev_ < 0) {
+        throw std::runtime_error(
+            "PhxLoaderV2: phxfs_find_dev_for_cuda_gpu(" +
+            std::to_string(cuda_device_id) + ") failed with " +
+            std::to_string(dev_));
+    }
+
+    int ret = phxfs_open(dev_);
+    if (ret < 0) {
+        throw std::runtime_error("PhxLoaderV2: phxfs_open(" +
+                                 std::to_string(dev_) + ") failed with " +
+                                 std::to_string(ret));
+    }
+    initialized_ = true;
+}
+
+PhxLoaderV2::~PhxLoaderV2() {
+    if (initialized_) {
+        try {
+            close();
+        } catch (...) {
+            // Suppress exceptions in destructor
+        }
+    }
+}
+
+uintptr_t PhxLoaderV2::regmem(void *gpu_ptr, size_t size) {
+    // Align size up to GPU_PAGE_SIZE (64K), required by phxfs_regmem
+    size_t aligned_size = align_up(size, GPU_PAGE_SIZE);
+
+    void *target_addr = nullptr;
+    int ret = phxfs_regmem(dev_, gpu_ptr, aligned_size, &target_addr);
+    if (ret < 0) {
+        throw std::runtime_error(
+            "PhxLoaderV2::regmem: phxfs_regmem failed with " +
+            std::to_string(ret) + ", size=" + std::to_string(size) +
+            ", aligned_size=" + std::to_string(aligned_size));
+    }
+
+    auto key = reinterpret_cast<uintptr_t>(gpu_ptr);
+    reg_map_[key] = {aligned_size, reinterpret_cast<uintptr_t>(target_addr)};
+
+    return reinterpret_cast<uintptr_t>(target_addr);
+}
+
+void PhxLoaderV2::deregmem(void *gpu_ptr, size_t size) {
+    auto key = reinterpret_cast<uintptr_t>(gpu_ptr);
+    auto it = reg_map_.find(key);
+    if (it == reg_map_.end()) {
+        return;  // Not registered, nothing to do
+    }
+
+    size_t aligned_size = it->second.first;
+    int ret = phxfs_deregmem(dev_, gpu_ptr, aligned_size);
+    if (ret < 0) {
+        // Log but don't throw in cleanup path
+        fprintf(stderr,
+                "PhxLoaderV2::deregmem: phxfs_deregmem failed with %d\n", ret);
+    }
+
+    reg_map_.erase(it);
+}
+
+void PhxLoaderV2::read_into_registered(
+    const std::string &path, uintptr_t gpu_ptr,
+    const std::vector<std::tuple<off_t, off_t, size_t>> &batch) {
+
+    // Verify gpu_ptr is registered
+    auto it = reg_map_.find(gpu_ptr);
+    if (it == reg_map_.end()) {
+        throw std::runtime_error(
+            "PhxLoaderV2::read_into_registered: gpu_ptr " +
+            std::to_string(gpu_ptr) + " not registered");
+    }
+
+    if (batch.empty()) {
+        return;  // Nothing to read
+    }
+
+    // Open file with O_DIRECT for DMA
+    int fd = open(path.c_str(), O_RDONLY | O_DIRECT);
+    if (fd < 0) {
+        throw std::system_error(errno, std::system_category(),
+                                "PhxLoaderV2::read_into_registered: open(" +
+                                    path + ")");
+    }
+
+    try {
+        phxfs_fileid_t fid;
+        fid.fd = fd;
+        fid.deviceID = dev_;
+
+        // Serial phxfs_read for each batch item.
+        // Each item is (buf_offset, file_offset, nbytes), all 4K-aligned
+        // by the Python side (build_read_groups).
+        for (const auto &item : batch) {
+            off_t buf_offset = std::get<0>(item);
+            off_t file_offset = std::get<1>(item);
+            size_t nbytes = std::get<2>(item);
+
+            ssize_t result = phxfs_read(
+                fid,
+                reinterpret_cast<void *>(gpu_ptr),
+                buf_offset,
+                static_cast<ssize_t>(nbytes),
+                file_offset);
+
+            if (result < 0) {
+                throw std::runtime_error(
+                    "PhxLoaderV2::read_into_registered: phxfs_read failed "
+                    "with " + std::to_string(result) + ", path=" + path +
+                    ", buf_offset=" + std::to_string(buf_offset) +
+                    ", file_offset=" + std::to_string(file_offset) +
+                    ", nbytes=" + std::to_string(nbytes));
+            }
+
+            // Tolerate short reads for the tail padding region.
+            // The actual tensor data ends before file_size, which is within
+            // the readable range. Short reads only occur when aligned_end
+            // exceeds file_size (4K alignment padding at file tail).
+            if (static_cast<size_t>(result) < nbytes) {
+                // Short read: only warn, don't throw. The Python side
+                // ensures tensor data is within [file_offset, file_size].
+                fprintf(stderr,
+                        "PhxLoaderV2::read_into_registered: short read "
+                        "(expected %zu, got %zd) at file_offset=%lld, "
+                        "path=%s — likely file tail padding, continuing\n",
+                        nbytes, result,
+                        (long long)file_offset, path.c_str());
+            }
+        }
+
+        ::close(fd);
+    } catch (...) {
+        ::close(fd);
+        throw;
+    }
+}
+
+void PhxLoaderV2::close() {
+    if (!initialized_) {
+        return;
+    }
+
+    // Deregister any remaining registered memory
+    for (const auto &[gpu_ptr, info] : reg_map_) {
+        void *ptr = reinterpret_cast<void *>(gpu_ptr);
+        int ret = phxfs_deregmem(dev_, ptr, info.first);
+        if (ret < 0) {
+            fprintf(stderr,
+                    "PhxLoaderV2::close: phxfs_deregmem failed with %d\n", ret);
+        }
+    }
+    reg_map_.clear();
+
+    int ret = phxfs_close(dev_);
+    if (ret < 0) {
+        fprintf(stderr, "PhxLoaderV2::close: phxfs_close failed with %d\n",
+                ret);
+    }
+    initialized_ = false;
+}
