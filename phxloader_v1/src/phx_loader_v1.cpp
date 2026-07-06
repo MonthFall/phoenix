@@ -134,7 +134,7 @@ off_t PhxLoaderV1::read_data_section(const std::string &path, uintptr_t gpu_ptr,
 
         // Sanity: we must have read enough to cover the requested data
         off_t data_end_in_file = data_offset + data_size;
-        if (aligned_end < data_end_in_file && file_size < data_end_in_file) {
+        if (file_size < data_end_in_file) {
             throw std::runtime_error(
                 "PhxLoaderV1::read_data_section: requested data extends beyond "
                 "file size, data_end=" + std::to_string(data_end_in_file) +
