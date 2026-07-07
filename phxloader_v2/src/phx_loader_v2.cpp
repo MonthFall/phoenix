@@ -165,6 +165,37 @@ void PhxLoaderV2::read_into_registered(
     }
 }
 
+void PhxLoaderV2::read_into_registered_async(
+    const std::string &path, uintptr_t gpu_ptr,
+    const std::vector<std::tuple<off_t, off_t, size_t>> &batch) {
+    // If a previous async DMA is still running, wait for it first.
+    if (dma_future_.valid()) {
+        dma_future_.wait();
+    }
+    // Launch DMA in a C++ thread (not affected by Python GIL).
+    // Capture copies of path/batch/gpu_ptr (path and batch are copied by value
+    // to avoid lifetime issues).
+    dma_future_ = std::async(std::launch::async, [this, path, gpu_ptr, batch]() {
+        this->read_into_registered(path, gpu_ptr, batch);
+    });
+}
+
+void PhxLoaderV2::wait_dma() {
+    if (dma_future_.valid()) {
+        dma_future_.wait();
+        dma_future_.get();  // rethrow any exception from the async task
+    }
+}
+
+double PhxLoaderV2::get_dma_seconds() const {
+    return static_cast<double>(dma_time_ns_.load(std::memory_order_relaxed))
+           / 1e9;
+}
+
+void PhxLoaderV2::reset_dma_timer() {
+    dma_time_ns_.store(0, std::memory_order_relaxed);
+}
+
 void PhxLoaderV2::close() {
     if (!initialized_) {
         return;

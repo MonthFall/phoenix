@@ -1,7 +1,10 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -43,6 +46,22 @@ public:
         const std::string &path, uintptr_t gpu_ptr,
         const std::vector<std::tuple<off_t, off_t, size_t>> &batch);
 
+    /// Async version of read_into_registered: launches DMA in a C++ thread
+    /// (std::async) and returns immediately. Use wait_dma() to join.
+    void read_into_registered_async(
+        const std::string &path, uintptr_t gpu_ptr,
+        const std::vector<std::tuple<off_t, off_t, size_t>> &batch);
+
+    /// Wait for the most recent read_into_registered_async to complete.
+    void wait_dma();
+
+    /// Get accumulated pure DMA time (seconds) measured inside phxfs_read
+    /// loops via steady_clock. Independent of Python main thread timing.
+    double get_dma_seconds() const;
+
+    /// Reset the DMA timer to zero.
+    void reset_dma_timer();
+
     /// Close the phxfs device. Called automatically by destructor.
     void close();
 
@@ -53,4 +72,10 @@ private:
 
     // Tracks registered memory: gpu_ptr -> (aligned_size, cpu_target_addr)
     std::unordered_map<uintptr_t, std::pair<size_t, uintptr_t>> reg_map_;
+
+    // Async DMA support
+    std::future<void> dma_future_;
+
+    // Pure DMA timing (accumulated across all async calls, thread-safe)
+    std::atomic<long long> dma_time_ns_{0};
 };
