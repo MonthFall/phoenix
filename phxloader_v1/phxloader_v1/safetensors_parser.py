@@ -1,6 +1,7 @@
 """Safetensors header parser for Phoenix weight loading (V1)."""
 
 import json
+import os
 from typing import Optional
 
 import torch
@@ -34,8 +35,26 @@ def parse_safetensor_header(
     """
     with open(st_file, "rb") as f:
         # First 8 bytes: little-endian uint64 = JSON header length
-        header_len = int.from_bytes(f.read(8), "little")
+        length_bytes = f.read(8)
+        if len(length_bytes) != 8:
+            raise ValueError(
+                f"Safetensors file '{st_file}' is too small: expected 8 bytes "
+                f"for header length field, got {len(length_bytes)}"
+            )
+        header_len = int.from_bytes(length_bytes, "little")
+        file_size = os.path.getsize(st_file)
+        if header_len > file_size - 8:
+            raise ValueError(
+                f"Safetensors file '{st_file}': declared header length "
+                f"{header_len} exceeds remaining file size {file_size - 8}"
+            )
+
         header_json = f.read(header_len)
+        if len(header_json) != header_len:
+            raise ValueError(
+                f"Safetensors file '{st_file}' is truncated: expected "
+                f"{header_len} bytes of header JSON, got {len(header_json)}"
+            )
 
     header = json.loads(header_json)
 
