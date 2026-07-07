@@ -1,4 +1,4 @@
-#include "phx_loader_v2.h"
+#include "phx_loader.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -23,26 +23,26 @@ inline size_t align_up(size_t val, size_t alignment) {
 
 }  // namespace
 
-PhxLoaderV2::PhxLoaderV2(int cuda_device_id)
+PhxLoader::PhxLoader(int cuda_device_id)
     : cuda_device_(cuda_device_id), initialized_(false) {
     dev_ = phxfs_find_dev_for_cuda_gpu(cuda_device_id);
     if (dev_ < 0) {
         throw std::runtime_error(
-            "PhxLoaderV2: phxfs_find_dev_for_cuda_gpu(" +
+            "PhxLoader: phxfs_find_dev_for_cuda_gpu(" +
             std::to_string(cuda_device_id) + ") failed with " +
             std::to_string(dev_));
     }
 
     int ret = phxfs_open(dev_);
     if (ret < 0) {
-        throw std::runtime_error("PhxLoaderV2: phxfs_open(" +
+        throw std::runtime_error("PhxLoader: phxfs_open(" +
                                  std::to_string(dev_) + ") failed with " +
                                  std::to_string(ret));
     }
     initialized_ = true;
 }
 
-PhxLoaderV2::~PhxLoaderV2() {
+PhxLoader::~PhxLoader() {
     if (initialized_) {
         try {
             close();
@@ -52,7 +52,7 @@ PhxLoaderV2::~PhxLoaderV2() {
     }
 }
 
-uintptr_t PhxLoaderV2::regmem(void *gpu_ptr, size_t size) {
+uintptr_t PhxLoader::regmem(void *gpu_ptr, size_t size) {
     // Align size up to GPU_PAGE_SIZE (64K), required by phxfs_regmem
     size_t aligned_size = align_up(size, GPU_PAGE_SIZE);
 
@@ -60,7 +60,7 @@ uintptr_t PhxLoaderV2::regmem(void *gpu_ptr, size_t size) {
     int ret = phxfs_regmem(dev_, gpu_ptr, aligned_size, &target_addr);
     if (ret < 0) {
         throw std::runtime_error(
-            "PhxLoaderV2::regmem: phxfs_regmem failed with " +
+            "PhxLoader::regmem: phxfs_regmem failed with " +
             std::to_string(ret) + ", size=" + std::to_string(size) +
             ", aligned_size=" + std::to_string(aligned_size));
     }
@@ -71,7 +71,7 @@ uintptr_t PhxLoaderV2::regmem(void *gpu_ptr, size_t size) {
     return reinterpret_cast<uintptr_t>(target_addr);
 }
 
-void PhxLoaderV2::deregmem(void *gpu_ptr, size_t size) {
+void PhxLoader::deregmem(void *gpu_ptr, size_t size) {
     auto key = reinterpret_cast<uintptr_t>(gpu_ptr);
     auto it = reg_map_.find(key);
     if (it == reg_map_.end()) {
@@ -83,13 +83,13 @@ void PhxLoaderV2::deregmem(void *gpu_ptr, size_t size) {
     if (ret < 0) {
         // Log but don't throw in cleanup path
         fprintf(stderr,
-                "PhxLoaderV2::deregmem: phxfs_deregmem failed with %d\n", ret);
+                "PhxLoader::deregmem: phxfs_deregmem failed with %d\n", ret);
     }
 
     reg_map_.erase(it);
 }
 
-void PhxLoaderV2::read_into_registered(
+void PhxLoader::load_tensors_into_buffer(
     const std::string &path, uintptr_t gpu_ptr,
     const std::vector<std::tuple<off_t, off_t, size_t>> &batch) {
 
@@ -97,7 +97,7 @@ void PhxLoaderV2::read_into_registered(
     auto it = reg_map_.find(gpu_ptr);
     if (it == reg_map_.end()) {
         throw std::runtime_error(
-            "PhxLoaderV2::read_into_registered: gpu_ptr " +
+            "PhxLoader::load_tensors_into_buffer: gpu_ptr " +
             std::to_string(gpu_ptr) + " not registered");
     }
 
@@ -109,7 +109,7 @@ void PhxLoaderV2::read_into_registered(
     int fd = open(path.c_str(), O_RDONLY | O_DIRECT);
     if (fd < 0) {
         throw std::system_error(errno, std::system_category(),
-                                "PhxLoaderV2::read_into_registered: open(" +
+                                "PhxLoader::load_tensors_into_buffer: open(" +
                                     path + ")");
     }
 
@@ -143,7 +143,7 @@ void PhxLoaderV2::read_into_registered(
 
             if (result < 0) {
                 throw std::runtime_error(
-                    "PhxLoaderV2::read_into_registered: phxfs_read failed "
+                    "PhxLoader::load_tensors_into_buffer: phxfs_read failed "
                     "with " + std::to_string(result) + ", path=" + path +
                     ", buf_offset=" + std::to_string(buf_offset) +
                     ", file_offset=" + std::to_string(file_offset) +
@@ -158,7 +158,7 @@ void PhxLoaderV2::read_into_registered(
                 // Short read: only warn, don't throw. The Python side
                 // ensures tensor data is within [file_offset, file_size].
                 fprintf(stderr,
-                        "PhxLoaderV2::read_into_registered: short read "
+                        "PhxLoader::load_tensors_into_buffer: short read "
                         "(expected %zu, got %zd) at file_offset=%lld, "
                         "path=%s — likely file tail padding, continuing\n",
                         nbytes, result,
@@ -173,7 +173,7 @@ void PhxLoaderV2::read_into_registered(
     }
 }
 
-void PhxLoaderV2::read_into_registered_async(
+void PhxLoader::load_tensors_into_buffer_async(
     const std::string &path, uintptr_t gpu_ptr,
     const std::vector<std::tuple<off_t, off_t, size_t>> &batch) {
     // If a previous async DMA is still running, wait for it first.
@@ -184,27 +184,27 @@ void PhxLoaderV2::read_into_registered_async(
     // Capture copies of path/batch/gpu_ptr (path and batch are copied by value
     // to avoid lifetime issues).
     dma_future_ = std::async(std::launch::async, [this, path, gpu_ptr, batch]() {
-        this->read_into_registered(path, gpu_ptr, batch);
+        this->load_tensors_into_buffer(path, gpu_ptr, batch);
     });
 }
 
-void PhxLoaderV2::wait_dma() {
+void PhxLoader::wait_dma() {
     if (dma_future_.valid()) {
         dma_future_.wait();
         dma_future_.get();  // rethrow any exception from the async task
     }
 }
 
-double PhxLoaderV2::get_dma_seconds() const {
+double PhxLoader::get_dma_seconds() const {
     return static_cast<double>(dma_time_ns_.load(std::memory_order_relaxed))
            / 1e9;
 }
 
-void PhxLoaderV2::reset_dma_timer() {
+void PhxLoader::reset_dma_timer() {
     dma_time_ns_.store(0, std::memory_order_relaxed);
 }
 
-void PhxLoaderV2::close() {
+void PhxLoader::close() {
     if (!initialized_) {
         return;
     }
@@ -215,14 +215,14 @@ void PhxLoaderV2::close() {
         int ret = phxfs_deregmem(dev_, ptr, info.first);
         if (ret < 0) {
             fprintf(stderr,
-                    "PhxLoaderV2::close: phxfs_deregmem failed with %d\n", ret);
+                    "PhxLoader::close: phxfs_deregmem failed with %d\n", ret);
         }
     }
     reg_map_.clear();
 
     int ret = phxfs_close(dev_);
     if (ret < 0) {
-        fprintf(stderr, "PhxLoaderV2::close: phxfs_close failed with %d\n",
+        fprintf(stderr, "PhxLoader::close: phxfs_close failed with %d\n",
                 ret);
     }
     initialized_ = false;

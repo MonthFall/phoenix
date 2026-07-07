@@ -1,7 +1,8 @@
-"""Safetensors header parser for Phoenix weight loading (V2).
+"""Safetensors header parser for Phoenix weight loading.
 
-Identical to V1's implementation — parses the JSON header to extract
-tensor metadata without reading tensor data.
+Parses the JSON header to extract tensor metadata without reading
+tensor data. Includes boundary validation and header_len upper-bound
+protection.
 """
 
 import json
