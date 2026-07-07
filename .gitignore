@@ -14,3 +14,7 @@ sc25/logs/*
 build/
 *.so
 .codebuddy/*
+<<<<<<< HEAD
+=======
+*.egg-info/
+>>>>>>> ba0610a (phxloader-v1 implementation)
