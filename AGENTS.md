@@ -1,0 +1,60 @@
+# AGENTS.md — Phoenix developer orientation (for AI coding agents)
+
+This file is the **single entry point** for AI agents working in this repository. Read it first; do **not** read the whole tree unless a task requires it. Detailed docs live in `doc/`.
+
+## What this project is
+
+Phoenix is middleware for **direct I/O from storage to xPU (GPU/NPU)** via DMA, bypassing CPU host memory ("phony buffers"). Three layers: a Linux kernel module (`phxfs`), a user-space library (`libphoenix`) + Python bindings, and application **adapters** (vLLM done; lmcache planned).
+
+## Directory map (responsibilities)
+
+| Path | Role |
+| --- | --- |
+| `module/` | `phxfs` kernel module — GPU BAR remap, per-GPU char device, `mmap`/`ioctl` P2P mapping |
+| `libphoenix/` | User C/C++ lib — `phxfs_open/close`, `regmem/deregmem`, `read/write`, async (`integration.cc`) |
+| `python/` | `phxfs` ctypes Python package |
+| `adapters/vllm/phxloader/` | vLLM weight loader (safetensors → GPU DMA), published `phxloader` pkg |
+| `adapters/lmcache/` | (roadmap) KV-cache acceleration |
+| `example/` | Minimal end-to-end example |
+| `benchmarks/` | Perf binaries: breakdown, end-to-end, kvcache, micro, safetensor |
+| `tests/` | Correctness tests (`.cu`) |
+| `scripts/` | Helper/eval scripts (paths are env-specific — users must edit) |
+| `third-party/fio/` | fio submodule for I/O testing |
+| `doc/` | All documentation (index: `doc/README.md`) |
+
+## Build / test / install (reference environment)
+
+```shell
+# prerequisites: NVIDIA GDS + MLNX_OFED, kernel source for running kernel, CUDA 12.4, liburing
+mkdir -p build && cd build && cmake ../ && make -j
+sudo make insmod          # insert kernel module (run `nvidia-smi` first)
+sudo make rmmod           # remove
+ctest                     # (if enabled) run tests
+```
+Skip the module: `cmake -Dno_module=true ../`.
+
+## Common tasks
+
+**Kernel module work** — edit under `module/`; rebuild with `make` in `build/`; `sudo make insmod`. Watch `dmesg` for `phxfs*` messages. If `insmod` fails with "Operation not permitted", the GPU BAR is held by another process/driver (see `doc/troubleshooting.md`).
+
+**Library / API work** — edit `libphoenix/`; `libphoenix.so` is consumed by `python/` (ctypes) and adapters.
+
+**App integration** — vLLM: `adapters/vllm/phxloader` exposes `PhxLoader` and a `phxsafetensors` load_format. New adapters register a GPU buffer via `libphoenix` and DMA through `phxfs_read`/`phxfs_write`.
+
+**Bug reporting** — run `bash scripts/collect_bug_info.sh` to produce a structured report, then open an issue using `.github/ISSUE_TEMPLATE/bug_report.md`.
+
+## Gotchas (read before changing core code)
+
+- **BAR exclusivity**: only one driver may own the GPU PCIe BAR. Phoenix must be inserted when no other process/driver uses it.
+- **Registration size limit**: `regmem` > 32 GiB still fails (mapping descriptor uses `kmalloc`). Large transfers are chunked at `PHXFS_IO_CHUNK` (1 GiB) for `read`/`write` to stay under `MAX_RW_COUNT`.
+- **Async I/O**: current async path is `cudaLaunchHostFunc + pread/pwrite`, **not** `io_uring` yet (planned).
+- **NPU**: code is NVIDIA-only today; NPU support is research, not implemented.
+- **Scripts are env-specific**: `scripts/*.sh`/`*.py` hardcode dataset paths (e.g. `/home/sc25/...`); they need editing per environment and are not part of the build.
+
+## Where to look
+
+- Architecture / data path: `doc/architecture.md`
+- Kernel interfaces: `doc/kernel-module.md`
+- Library API: `doc/libphoenix.md`
+- Adapter guide: `doc/adapters.md`
+- Roadmap (eng + research + MCP): `doc/roadmap.md`

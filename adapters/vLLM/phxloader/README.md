@@ -11,7 +11,7 @@
 - 单次连续 DMA 读取整个 safetensors data section（`read_data_section`）
 - 每个文件独立分配 GPU buffer，4K 对齐
 - 同步阻塞式 I/O，读完后才 yield
-- 实现位置：`phxloader_v1/`（历史保留，不修改）
+- 实现位置：`phxloader_v1/`（历史版本，代码保留在 `tencent-backup` 分支）
 - vllm load_format：`phxsafetensors_v1`
 
 ### V2 — Batch DMA + 共享 Buffer
@@ -20,7 +20,7 @@
 - 单一共享 GPU buffer 跨所有文件复用，通过 `regmem`/`deregmem` 注册
 - 每个 read group 一次 `phxfs_read`（批量 DMA），取代 V1 的整段读取
 - 方法名：`read_into_registered`
-- 实现位置：`phxloader_v2/`（历史保留，不修改）
+- 实现位置：`phxloader_v2/`（历史版本，代码保留在 `tencent-backup` 分支）
 - vllm load_format：`phxsafetensors_v2`
 
 ### V2.1 — 双缓冲 + 异步 DMA
@@ -29,7 +29,7 @@
 - `read_into_registered_async` 在 C++ 后台线程执行 DMA，`wait_dma` 等待完成
 - `yield(copy_)` 与下一文件的后台 DMA 重叠，隐藏 yield 延迟（约 2.5s）
 - 新增 DMA 计时器（`reset_dma_timer` / `get_dma_seconds`），纯 DMA 耗时可观测
-- 实现位置：`phxloader_v2/`（与 V2 共用 C++ 实现，异步路径由 vllm 侧迭代器驱动）
+- 实现位置：`phxloader_v2/`（历史版本，与 V2 共用 C++ 实现，异步路径由 vllm 侧迭代器驱动；代码保留在 `tencent-backup` 分支）
 - vllm load_format：`phxsafetensors_v2_1`
 
 ### V2.2（当前版本）— 正式发行 + API 重命名

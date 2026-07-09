@@ -9,12 +9,10 @@ scripts/results/*
 motivation/breakdown
 tools/ccan
 scripts/results*
-sc25/result*
-sc25/logs/*
 build/
 *.so
+.egg-info/
 .codebuddy/*
-<<<<<<< HEAD
-=======
-*.egg-info/
->>>>>>> ba0610a (phxloader-v1 implementation)
+# Keep the project's shared AI developer skill tracked
+!.codebuddy/skills/
+!.codebuddy/skills/**
