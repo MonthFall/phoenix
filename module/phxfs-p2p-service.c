@@ -1,11 +1,11 @@
 /*
  * Phoenix P2P Service Export
  *
- * When Phoenix has remapped a GPU's BAR via devm_memremap_pages
- * (MEMORY_DEVICE_PCI_P2PDMA), nvidia_p2p_dma_map_pages fails for
- * that GPU. This service bypasses nvidia_p2p_dma_map_pages and
- * returns the physical addresses from nvidia_p2p_get_pages directly
- * as DMA bus addresses (valid under IOMMU=pt).
+ * When Phoenix has remapped a device's BAR via devm_memremap_pages
+ * (MEMORY_DEVICE_PCI_P2PDMA), vendor-specific DMA map calls may fail
+ * for that device. This service bypasses DMA mapping and returns the
+ * physical addresses from the backend's get_pages directly as DMA bus
+ * addresses (valid under IOMMU=pt).
  */
 
 #include <linux/module.h>
@@ -13,13 +13,12 @@
 #include <linux/compiler.h>
 
 #include "phxfs-p2p-service.h"
-#include "nvfs-p2p.h"
-#include "nvfs-core.h"   /* GPU_PAGE_SIZE */
+#include "phxfs-backend.h"
 #include "phxfs.h"        /* phxfs_err / phxfs_warn / phxfs_info */
 #include "config-host.h"
 
 struct phxfs_p2p_handle {
-	struct nvidia_p2p_page_table *pages;
+	struct phxfs_page_table       *pt;
 	uint64_t                     *ioaddrs;    /* kmalloc'd */
 	uint32_t                      n_addrs;
 	uint64_t                      gpu_vaddr;
@@ -30,7 +29,7 @@ struct phxfs_p2p_handle {
  * phxfs_p2p_free_cb - called by NVIDIA driver when it forcefully
  * reclaims the GPU pages (e.g. GPU context destroyed).
  *
- * We must NOT call nvidia_p2p_put_pages here (the driver is already
+ * We must NOT call put_pages here (the driver is already
  * reclaiming). We free the page_table struct via free_page_table and
  * mark the handle as invalidated so the caller's subsequent deregister
  * skips put_pages.
@@ -53,9 +52,9 @@ static void phxfs_p2p_free_cb(void *data)
 
 	WRITE_ONCE(h->invalidated, 1);
 
-	if (h->pages) {
-		nvfs_nvidia_p2p_free_page_table(h->pages);
-		h->pages = NULL;
+	if (h->pt) {
+		phxfs_p2p->free_page_table(h->pt);
+		h->pt = NULL;
 	}
 
 	module_put(THIS_MODULE);
@@ -71,7 +70,7 @@ int phxfs_p2p_register(uint64_t gpu_vaddr,
                        uint32_t *out_n_addrs)
 {
 	struct phxfs_p2p_handle *h;
-	int err, i;
+	int err;
 
 	if (!out_handle || !out_ioaddrs || !out_n_addrs)
 		return -EINVAL;
@@ -90,12 +89,12 @@ int phxfs_p2p_register(uint64_t gpu_vaddr,
 	h->gpu_vaddr   = gpu_vaddr;
 	h->invalidated = 0;
 
-	/* Step 1: pin GPU pages -- works even with BAR remapped */
-	err = nvfs_nvidia_p2p_get_pages(0, 0, gpu_vaddr, length,
-	                                &h->pages, phxfs_p2p_free_cb, h);
-	if (err || !h->pages) {
+	/* Step 1: pin device pages */
+	err = phxfs_p2p->get_pages(gpu_vaddr, length,
+	                           &h->pt, phxfs_p2p_free_cb, h);
+	if (err || !h->pt) {
 		int ret = err ? err : -ENOMEM;
-		phxfs_err("phxfs_p2p_register: nvfs_nvidia_p2p_get_pages failed, "
+		phxfs_err("phxfs_p2p_register: get_pages failed, "
 			  "vaddr=0x%llx len=%llu err=%d\n",
 			  (unsigned long long)gpu_vaddr,
 			  (unsigned long long)length, ret);
@@ -106,26 +105,24 @@ int phxfs_p2p_register(uint64_t gpu_vaddr,
 
 	/* Step 2: extract physical addresses as bus addresses.
 	 * Under IOMMU=pt (deployment contract), phys == bus address.
-	 * We deliberately skip nvidia_p2p_dma_map_pages -- it fails
-	 * when Phoenix has remapped the BAR. */
-	h->n_addrs = h->pages->entries;
+	 * We deliberately skip vendor DMA map — it fails when Phoenix
+	 * has remapped the BAR. */
+	h->n_addrs = phxfs_p2p->get_n_pages(h->pt);
 	h->ioaddrs = kmalloc_array(h->n_addrs, sizeof(uint64_t), GFP_KERNEL);
 	if (!h->ioaddrs) {
-		nvfs_nvidia_p2p_put_pages(0, 0, gpu_vaddr, h->pages);
+		phxfs_p2p->put_pages(gpu_vaddr, h->pt);
 		kfree(h);
 		module_put(THIS_MODULE);
 		return -ENOMEM;
 	}
-	for (i = 0; i < h->n_addrs; i++) {
-		if (!h->pages->pages[i]) {
-			phxfs_err("phxfs_p2p_register: page[%d] is NULL\n", i);
-			kfree(h->ioaddrs);
-			nvfs_nvidia_p2p_put_pages(0, 0, gpu_vaddr, h->pages);
-			kfree(h);
-			module_put(THIS_MODULE);
-			return -ENOMEM;
-		}
-		h->ioaddrs[i] = h->pages->pages[i]->physical_address;
+	err = phxfs_p2p->get_phys_addrs(h->pt, h->ioaddrs, h->n_addrs);
+	if (err) {
+		phxfs_err("phxfs_p2p_register: get_phys_addrs failed, err=%d\n", err);
+		kfree(h->ioaddrs);
+		phxfs_p2p->put_pages(gpu_vaddr, h->pt);
+		kfree(h);
+		module_put(THIS_MODULE);
+		return err;
 	}
 
 	*out_handle  = h;
@@ -157,8 +154,8 @@ void phxfs_p2p_deregister(struct phxfs_p2p_handle *handle)
 	was_invalidated = READ_ONCE(handle->invalidated);
 	need_module_put = !was_invalidated;
 
-	if (need_module_put && handle->pages)
-		nvfs_nvidia_p2p_put_pages(0, 0, gpu_vaddr, handle->pages);
+	if (need_module_put && handle->pt)
+		phxfs_p2p->put_pages(gpu_vaddr, handle->pt);
 
 	kfree(handle->ioaddrs);
 	kfree(handle);

@@ -2,7 +2,9 @@
 #include <pthread.h>
 #include <sys/types.h>
 #include <unistd.h>
+#ifdef PHXFS_HAVE_LIBURING
 #include <liburing.h>
+#endif
 #include <cuda.h>
 #include <pthread.h>
 #include "phxfs_utils.h"

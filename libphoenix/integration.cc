@@ -1,7 +1,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
+#ifdef PHXFS_HAVE_LIBURING
 #include <liburing.h>
+#endif
 #include <sys/types.h>
 #include <unistd.h>
 

@@ -11,6 +11,10 @@
 #include <linux/printk.h>
 
 #define MAX_DEV_NUM 16
+#define MAX_GPU_DEVS 64
+
+/* Forward declaration — full definition in phxfs-backend.h */
+struct phxfs_page_table;
 
 /* Phoenix logging macros */
 extern int phxfs_debug;
@@ -82,6 +86,27 @@ struct find_info {
     u64 offset;
     int thread_id;
     bool found;
+};
+
+/* P2P mapping descriptor (vendor-agnostic) */
+struct p2p_vmap;
+typedef void (*release_fn)(struct p2p_vmap*);
+
+struct gpu_region {
+    struct phxfs_page_table *pt;
+};
+
+struct p2p_vmap {
+    u64          gpuvaddr;
+    u64          gpupaddr;
+    u64          size;
+    u64          cpuvaddr;
+    release_fn   release;
+    struct page **pages;
+    unsigned long page_size;
+    void        *data;           /* points to struct gpu_region */
+    unsigned long n_addrs;
+    uint64_t     addrs[1];
 };
 
 struct phxfs_dev_info_s {

@@ -16,7 +16,23 @@ find_library (CUFILE_LIBRARIES cufile ${CUDA_TOOLKIT_ROOT_DIR}/lib64)
 find_library (DL_LIB dl REQUIRED)
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(LIBURING REQUIRED liburing)
+
+set (no_liburing false CACHE BOOL "Do not use liburing (io_uring async I/O)")
+
+if (NOT no_liburing)
+    pkg_check_modules(LIBURING liburing)
+    if (LIBURING_FOUND)
+        message(STATUS "liburing found: ${LIBURING_INCLUDE_DIRS}")
+    else ()
+        message(STATUS "liburing NOT found - io_uring async disabled")
+    endif ()
+else ()
+    message(STATUS "liburing disabled by no_liburing=ON")
+endif ()
+
+if (LIBURING_FOUND)
+    add_compile_definitions(PHXFS_HAVE_LIBURING)
+endif ()
 
 set (NVIDIA "" CACHE PATH "Path to Nvidia driver source")
 set (KERNEL "/lib/modules/${CMAKE_SYSTEM_VERSION}/build" CACHE PATH "Path to kernel source, or module directory")
@@ -25,6 +41,11 @@ set (nvidia_archs "90" CACHE STRING "NVIDIA compute architectures")
 set (no_module false CACHE BOOL "Do not build kernel module")
 set (no_cuda false CACHE BOOL "Do not build library with CUDA support")
 set (BUILD_SHARED_LIBS true CACHE BOOL "Build shared library, set to false for static")
+
+# Kernel module: target GPU vendor (single-vendor-per-machine).
+# This selects which P2P backend is compiled into the module.
+set (PHXFS_VENDOR "NVIDIA" CACHE STRING "Target GPU vendor for kernel module: NVIDIA, AMD, HUAWEI")
+set_property (CACHE PHXFS_VENDOR PROPERTY STRINGS NVIDIA AMD HUAWEI)
 
 if (no_smartio)
     set (no_smartio_samples true)
@@ -69,28 +90,45 @@ endif ()
 include_directories ("${PROJECT_SOURCE_DIR}/libphoenix/include"
                     "${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/include/")
 
-# Try to find Nvidia driver
-if (CUDA_FOUND AND NOT no_cuda)
+# Set vendor-specific backend object file and compile define
+if (PHXFS_VENDOR STREQUAL "NVIDIA")
+    set (VENDOR_BACKEND "nvidia-backend.o")
+    set (VENDOR_DEFINE "CONFIG_PHXFS_VENDOR_NVIDIA")
+elseif (PHXFS_VENDOR STREQUAL "AMD")
+    set (VENDOR_BACKEND "amd-backend.o")
+    set (VENDOR_DEFINE "CONFIG_PHXFS_VENDOR_AMD")
+elseif (PHXFS_VENDOR STREQUAL "HUAWEI")
+    set (VENDOR_BACKEND "huawei-backend.o")
+    set (VENDOR_DEFINE "CONFIG_PHXFS_VENDOR_HUAWEI")
+else ()
+    message (FATAL_ERROR "Unsupported PHXFS_VENDOR: ${PHXFS_VENDOR}. Use NVIDIA, AMD, or HUAWEI.")
+endif ()
 
-    # Try to find Nvidia headers (will choose the newest version)
-    file (GLOB_RECURSE driver_paths "/usr/src/nvidia-*/nv-p2p.h")
-    string (REPLACE "nv-p2p.h" "" driver_paths "${driver_paths}")
-    if (driver_paths)
-        list (REVERSE driver_paths)
+# Try to find Nvidia driver headers (only needed for NVIDIA backend)
+set (driver_include "")
+if (PHXFS_VENDOR STREQUAL "NVIDIA")
+    # Directly glob for nv-p2p.h in common locations
+    file (GLOB nv_p2p_files
+        "/usr/src/nvidia-*/nvidia-peermem/nv-p2p.h"
+        "/usr/src/nvidia-*/nv-p2p.h"
+        "${NVIDIA}/nv-p2p.h"
+        "${NVIDIA}/nvidia-peermem/nv-p2p.h")
+
+    if (nv_p2p_files)
+        list (REVERSE nv_p2p_files)
+        list (GET nv_p2p_files 0 first_match)
+        get_filename_component (driver_include "${first_match}" DIRECTORY)
     endif ()
 
-    find_path (driver_include NAMES "nv-p2p.h" PATHS "${NVIDIA}" ${driver_paths})
-    set (driver_dir "${driver_include}")
-
-    # Find Nvidia driver symbols
-    if (NOT EXISTS "${driver_dir}/Module.symvers")
-        get_filename_component (driver_dir "${driver_dir}" DIRECTORY)
-    endif ()
-
-    if ("${driver_dir}" STREQUAL "")
-        message(STATUS "No NVIDIA driver symbols found")
+    if (driver_include)
+        message(STATUS "Found NVIDIA driver header: ${driver_include}/nv-p2p.h")
     else ()
-        message(STATUS "Using NVIDIA driver found in ${driver_dir}")
+        message(WARNING
+            "nv-p2p.h not found! Searched:\n"
+            "  - /usr/src/nvidia-*/nvidia-peermem/nv-p2p.h\n"
+            "  - /usr/src/nvidia-*/nv-p2p.h\n"
+            "  - NVIDIA cache var: '${NVIDIA}'\n"
+            "Pass -DNVIDIA=/path/to/nvidia/driver/src to cmake.")
     endif ()
 endif ()
 
@@ -98,7 +136,11 @@ endif ()
 set (module_root "${PROJECT_SOURCE_DIR}/module")
 set (module_output "${CMAKE_BINARY_DIR}/module")
 # for Makefile.in, do not delete
-set (module_ccflags "-I${PROJECT_SOURCE_DIR}/libnvm/include -I${driver_include}")
+if (driver_include)
+    set (module_ccflags "-I${driver_include} -D${VENDOR_DEFINE}")
+else ()
+    set (module_ccflags "-D${VENDOR_DEFINE}")
+endif ()
 configure_file ("${module_root}/Makefile.in" "${module_output}/Makefile" @ONLY)
 message (STATUS "Configuring module build in ${module_output}")
 
@@ -150,38 +192,13 @@ macro (set_multithread target)
     target_link_libraries (${target} Threads::Threads)
 endmacro ()
 
-# Benchmarks
-set (benchmarks_root "${PROJECT_SOURCE_DIR}/benchmarks")
-set (benchmarks_utils "${benchmarks_root}/utils/")
+# Output directories (shared by remaining targets, e.g. example/)
 set (CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set (CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set (CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
-# Set preferred ordering for sample targets
-# Make benchmark target
-# We assume all benchmarks are CUDA programs
-message(STATUS "liburing include dir: ${LIBURING_INCLUDE_DIRS}")
-message(STATUS "liburing library dir: ${LIBURING_LIBRARIES}")
-macro (make_benchmark target binary_name files)
-
-    add_executable (${target}) # Ugly bugly
-    target_sources (${target} PRIVATE ${files})
-
-    add_dependencies (${target} libphoenix)
-    target_include_directories(${target} PRIVATE ${benchmarks_utils} ${libphoenix_root}/include ${LIBURING_INCLUDE_DIRS})
-    target_link_libraries (${target} libphoenix ${CUFILE_LIBRARIES}  CUDA::cudart cuda ${LIBURING_LIBRARIES} ${DL_LIB} Threads::Threads ${FS_LIBRARY})
-    set_target_properties (${target} PROPERTIES OUTPUT_NAME "${binary_name}")
-
-    list (APPEND benchmark_targets "${target}")
-    set (benchmark_targets "${benchmark_targets}" PARENT_SCOPE)
-
-endmacro ()
-
-add_subdirectory ("${PROJECT_SOURCE_DIR}/benchmarks/breakdown")
-add_subdirectory ("${PROJECT_SOURCE_DIR}/benchmarks/end-to-end")
-add_subdirectory ("${PROJECT_SOURCE_DIR}/benchmarks/kvcache")
-add_subdirectory ("${PROJECT_SOURCE_DIR}/benchmarks/micro-benchmarks")
-add_subdirectory ("${PROJECT_SOURCE_DIR}/benchmarks/safetensor")
+# Benchmarks are not built (the directory is scheduled for removal).
 
 add_subdirectory ("${PROJECT_SOURCE_DIR}/example/")
+add_subdirectory ("${PROJECT_SOURCE_DIR}/test/")
 

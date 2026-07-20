@@ -17,7 +17,9 @@
 #include <cuda_runtime.h>
 #include <vector>
 #include <algorithm> 
+#ifdef PHXFS_HAVE_LIBURING
 #include <liburing.h>
+#endif
 
 // global var
 #define DEFAULT_SIZE (1UL << 35) // 32 GB
@@ -105,7 +107,9 @@ typedef struct {
     unsigned long long io_operations; 
     std::vector<uint64_t> latency_vec;
     void *handler;
+#ifdef PHXFS_HAVE_LIBURING
     struct io_uring *ring;
+#endif
 } ThreadData;
 
 typedef struct{

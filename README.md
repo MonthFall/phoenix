@@ -5,12 +5,12 @@
 Phoenix refactors the I/O stack for GPU Direct Storage so that data moves from storage straight into accelerator memory via DMA — **bypassing CPU host-memory bounce buffers** ("phony buffers"). AI applications integrate through adapters, getting I/O acceleration with minimal changes.
 
 > 📄 Built on the SC'25 paper *"Phoenix: A Refactored I/O Stack for GPU Direct Storage without Phony Buffers"*.
-
+Phoenix is now a long-term open-source middleware for storage→xPU I/O, with adapters for AI data (vLLM done; lmcache planned).
 ## 📰 News
 
-- **2025** — Phoenix paper accepted at [SC'25](https://doi.org/10.1145/3712285.3759862).
-- **phxloader V2.2 released** — official adapter for **vLLM**: safetensors weight loading via DMA straight into GPU memory (`--load-format phxsafetensors`).
-- **Repository repositioned** — Phoenix is now a long-term open-source middleware for storage→xPU I/O, with adapters for AI data loading (vLLM done; lmcache planned).
+
+- **2026.7.10 phxloader released** — adapter for **vLLM**: safetensors weight loading via DMA straight into GPU memory (`--load-format phxsafetensors`).
+- **2025.12** — Phoenix paper accepted at [SC'25](https://doi.org/10.1145/3712285.3759862).
 
 ## What is Phoenix
 
@@ -26,6 +26,8 @@ The kernel module (`phxfs`) remaps GPU PCIe BAR memory and serves P2P mappings; 
 
 ## Features & supported matrix
 
+要加上支持什么模型。md支持什么样的展示方案？是否可以支持drawio？我想以一颗树的形式，从底层向上生长。 清晰的展示 支持底层的内核版本， IO技术， xPU 型号，应用场景，应用框架，模型。然后通过点击来扩展这个树。
+
 | Area | Status | Notes |
 | --- | --- | --- |
 | Core I/O (storage→GPU DMA, no phony buffer) | ✅ Implemented | `phxfs` + `libphoenix` |
@@ -35,6 +37,7 @@ The kernel module (`phxfs`) remaps GPU PCIe BAR memory and serves P2P mappings; 
 | NPU (non-NVIDIA) support | 🔬 Research | experimentally proven, not yet in code |
 | Async I/O (`io_uring`) | 🚧 Roadmap | currently `pread`/`pwrite` + CUDA host func |
 
+ 
 **Environment (tested)**
 
 - OS: Ubuntu 22.04 · Kernel: Linux 6.1 · NVIDIA driver 550.54 (open + `nvidia-fs`) · CUDA 12.4 · MLNX_OFED 24.10

@@ -13,8 +13,7 @@
 
  
 #include "phxfs-mem.h"  
-#include "nvfs-core.h"
-#include "nvfs-p2p.h"
+#include "phxfs-backend.h"
 #include "config-host.h"
 
 static DEFINE_HASHTABLE(phxfs_io_mbuffer_hash, PHXFS_MAX_SHADOW_ALLOCS_ORDER); 
@@ -91,9 +90,9 @@ void release_gpu_memory(struct p2p_vmap* map)
     gd = (struct gpu_region*) map->data;
     if (gd != NULL)
     {
-        if (gd->pages != NULL)
+        if (gd->pt != NULL)
         {
-            nvfs_nvidia_p2p_put_pages(0, 0, map->gpuvaddr, gd->pages);
+            phxfs_p2p->put_pages(map->gpuvaddr, gd->pt);
         }
         kfree(gd);
         map->data = NULL;
@@ -119,15 +118,15 @@ static void force_release_gpu_memory(struct p2p_vmap* map)
     if (gd != NULL)
     {
 
-        if (gd->pages != NULL)
+        if (gd->pt != NULL)
         {
-            nvfs_nvidia_p2p_put_pages(0, 0, map->gpuvaddr, gd->pages);
+            phxfs_p2p->put_pages(map->gpuvaddr, gd->pt);
         }
 
         kfree(gd);
         map->data = NULL;
 
-        phxfs_warn("Nvidia driver forcefully reclaimed %lu GPU pages\n", map->n_addrs);
+        phxfs_warn("Device driver forcefully reclaimed %lu GPU pages\n", map->n_addrs);
     	
 	}
 	unmap_and_release(map);
@@ -188,7 +187,7 @@ int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_l
         return -EINVAL;
 
     vma = mbuffer->vma;
-    page_size = GPU_PAGE_SIZE;
+    page_size = phxfs_p2p->page_size;
     mbuffer->subpage_num = page_size / PAGE_SIZE;
     dev = mbuffer->dev;
     
@@ -201,7 +200,7 @@ int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_l
     nr_dev_pages = DIV_ROUND_UP(dev_len, page_size);
 
     mbuffer->dev_page_num = nr_dev_pages;
-    if (dev_len < GPU_PAGE_SIZE) {
+    if (dev_len < page_size) {
         if (dev_len % PAGE_SIZE != 0){
             ret = -EINVAL;
             goto out;
@@ -245,7 +244,7 @@ int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_l
         goto out;
     }
 
-    mbuffer->map->page_size = GPU_PAGE_SIZE;
+    mbuffer->map->page_size = page_size;
     mbuffer->map->release = release_gpu_memory;
     mbuffer->map->size = dev_len;
     mbuffer->map->gpuvaddr = devaddr;
@@ -262,27 +261,22 @@ int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_l
         ret = -ENOMEM;
         goto out;
     }
-    gd->pages = NULL;
+    gd->pt = NULL;
     mbuffer->map->data = (struct gpu_region*)gd;
-    ret = nvfs_nvidia_p2p_get_pages(0, 0, mbuffer->map->gpuvaddr, GPU_PAGE_SIZE * mbuffer->map->n_addrs, &gd->pages, 
+    ret = phxfs_p2p->get_pages(mbuffer->map->gpuvaddr, page_size * mbuffer->map->n_addrs, &gd->pt, 
         (void (*)(void*)) force_release_gpu_memory, mbuffer->map);
-    if (ret != 0 || gd->pages == NULL) {
-        phxfs_err("nvfs_nvidia_p2p_get_pages failed, ret=%d\n", ret);
+    if (ret != 0 || gd->pt == NULL) {
+        phxfs_err("phxfs_p2p->get_pages failed, ret=%d\n", ret);
         if (ret == 0)
             ret = -ENOMEM;
         goto out;
     }
     pages_pinned = true;
 
-    for(i = 0; i < mbuffer->map->n_addrs; i++)
-    {
-        if(gd->pages->pages[i]==NULL)
-        {
-            phxfs_err("mem allocation not success, i is %d!\n",i);
-            ret = -ENOMEM;
-            goto out;
-        }
-        dev_page_addrs[i] = gd->pages->pages[i]->physical_address;
+    ret = phxfs_p2p->get_phys_addrs(gd->pt, dev_page_addrs, mbuffer->map->n_addrs);
+    if (ret) {
+        phxfs_err("get_phys_addrs failed, ret=%d\n", ret);
+        goto out;
     }
 
     mbuffer->dev_page_addrs = dev_page_addrs;
@@ -332,15 +326,15 @@ int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_l
 out:
     /*
      * Error teardown. If GPU pages were pinned, release them ourselves
-     * (nvfs_nvidia_p2p_put_pages() does not invoke the registered
+     * (put_pages() does not invoke the registered
      * force-release callback), then free the descriptors. This fixes the
      * previous NULL-deref / use-after-free that panicked the kernel when a
      * registration above ~2GiB failed (ppages kmalloc returned NULL and the
      * unchecked get_pages / out: path freed the still-referenced map & gd).
      */
-    if (pages_pinned && gd != NULL && gd->pages != NULL) {
-        nvfs_nvidia_p2p_put_pages(0, 0, devaddr, gd->pages);
-        gd->pages = NULL;
+    if (pages_pinned && gd != NULL && gd->pt != NULL) {
+        phxfs_p2p->put_pages(devaddr, gd->pt);
+        gd->pt = NULL;
     }
     if (gd != NULL) {
         kfree(gd);
@@ -485,8 +479,8 @@ int phxfs_add_phony_buffer(struct file *filp, struct vm_area_struct *vma) {
     if (dev == NULL)
         goto error;
 
-    // if the length is smaller than 2M, check for 2M alignment
-    if (buffer_len < GPU_PAGE_SIZE && (buffer_len % GPU_PAGE_SIZE)) {
+    // if the length is smaller than dev page, check for alignment
+    if (buffer_len < phxfs_p2p->page_size && (buffer_len % phxfs_p2p->page_size)) {
         // printk("mmap size not a multiple of 64k: 0x%llx for size >64k \n", buffer_len);
     }
 

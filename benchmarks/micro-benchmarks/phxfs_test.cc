@@ -433,7 +433,9 @@ int run_phxfs(GDSOpts opts){
         }
 
 
+#ifdef PHXFS_HAVE_LIBURING
         data->ring = NULL;
+#endif
 
 
         data->latency_vec.reserve(data->size / data->io_size + 10);

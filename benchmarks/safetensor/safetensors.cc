@@ -7,7 +7,9 @@
 #include <filesystem>
 #include <iostream>
 #include <iterator>
+#ifdef PHXFS_HAVE_LIBURING
 #include <liburing.h>
+#endif
 #include <sstream>
 #include <cuda.h>
 #include <cuda_runtime.h>

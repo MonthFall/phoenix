@@ -11,7 +11,7 @@ tools/ccan
 scripts/results*
 build/
 *.so
-.egg-info/
+temp/
 .codebuddy/*
 # Keep the project's shared AI developer skill tracked
 !.codebuddy/skills/
