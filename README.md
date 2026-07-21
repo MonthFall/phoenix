@@ -16,13 +16,9 @@ Phoenix is now a long-term open-source middleware for storage→xPU I/O, with ad
 
 Phoenix is a direct hub between storage and xPU — accelerators (GPU/NPU) and AI apps plug in, and data streams straight through:
 
-```
-      AI App (vLLM, lmcache, …)
-                  │ adapter
-                  ▼
-   storage ──► Phoenix ──► xPU (GPU / NPU)
-        no detour through host memory
-```
+<p align="center">
+  <img src="doc/phoenix-architecture.png" alt="Phoenix architecture: AI applications plug into the Phoenix hub, connecting storage to xPU accelerators" width="900">
+</p>
 
 The kernel module (`phxfs`) remaps GPU PCIe BAR memory and serves P2P mappings; the user library (`libphoenix`) and Python bindings expose simple registration/I/O APIs; adapters plug Phoenix into AI frameworks.
 
