@@ -50,24 +50,44 @@ Engineering (production hardening) and research (new capabilities) tracks are de
 
 ## Quick install & demo
 
+### 1. Build kernel module + user library
+
 ```shell
-# 1. prerequisites: NVIDIA GDS + MLNX_OFED (see doc/install.md)
-# 2. build
+# Default: NVIDIA GPU (no extra flags needed)
 mkdir -p build && cd build && cmake ../ && make -j
-# 3. install kernel module (run nvidia-smi first)
-sudo make insmod
-# 4. quick demo
-sudo ./bin/example <file_path> <io_size> <mode>
+
+# For other vendors (not yet implemented, interface ready):
+# cmake -DPHXFS_VENDOR=AMD ../
+# cmake -DPHXFS_VENDOR=HUAWEI ../
 ```
 
-For vLLM weight loading:
+This produces:
+- `build/libphoenix.so` — user-space library
+- `build/module/phoenixfs.ko` — kernel module
+- `build/bin/test_regmem`, `build/bin/test_io` — test programs
+
+### 2. Insert kernel module
 
 ```shell
-cd adapters/vllm/phxloader && bash install.sh
-# then launch vLLM with: --load-format phxsafetensors
+# Run nvidia-smi first to wake up the GPU BAR, then insert
+nvidia-smi
+sudo make insmod
+
+# Verify: 8 GPU devices should appear
+ls /dev/phxfs_dev*
+# Check dmesg for BAR remap messages
+dmesg | tail -20
 ```
 
-Full instructions: [doc/install.md](doc/install.md).
+### 3. Run tests
+
+```shell
+# Memory registration lifecycle (32 checks)
+./bin/test_regmem 0          # GPU 0
+
+# I/O correctness + performance (19 checks + throughput)
+./bin/test_io 0              # GPU 0
+```
 
 ## Documentation
 

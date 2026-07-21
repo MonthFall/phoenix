@@ -185,12 +185,12 @@ add_custom_target(
 
 # Library source files
 set(libphoenix_root "${PROJECT_SOURCE_DIR}/libphoenix")
-file(GLOB libphoenix_source "${libphoenix_root}/*.cc")
+file(GLOB libphoenix_source "${libphoenix_root}/*.cpp")
 file(GLOB libphoenix_include "${libphoenix_root}/include/*.h")
 
 # Select vendor-specific connector source file
 if (PHXFS_VENDOR STREQUAL "NVIDIA")
-    set(devconn_source "${libphoenix_root}/connectors/nvidia_connector.cc")
+    set(devconn_source "${libphoenix_root}/connectors/nvidia_connector.cpp")
 elseif (PHXFS_VENDOR STREQUAL "AMD")
     set(devconn_source "${libphoenix_root}/connectors/amd_connector.cc")
 elseif (PHXFS_VENDOR STREQUAL "HUAWEI")
