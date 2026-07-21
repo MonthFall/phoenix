@@ -16,6 +16,7 @@
 
 #include "phoenix.h"
 #include "connectors/devconnector.h"
+#include "io_engine.h"
 
 #define HUGE_PAGE_SIZE (64 * 1024)
 #define SMALL_PAGE_SIZE (4 * 1024)
@@ -131,35 +132,43 @@ bool is_phxfs_initialized() {
     return initialized;
 }
 
+/*
+ * Open a phxfs device. Each device is initialised independently and only
+ * once; a global lock makes concurrent phxfs_open() from multiple threads
+ * (e.g. one worker per GPU) safe. deviceID == -1 opens all devices.
+ */
+static pthread_mutex_t g_open_lock = PTHREAD_MUTEX_INITIALIZER;
+
 int phxfs_open(int deviceID) {
-    int ret;
-    if (!is_phxfs_initialized()) {
-        if (deviceID == -1) {
-            for (int id = 0; id < g_device_count; ++id) {
-                if (!phxfs_initialized[id]) {
-                    ret = __phxfs_open(phxfs_dev_path[id].c_str(), &mbuffer[id]);
-                    if (ret < 0) {
-                        phxfs_close_all();
-                        return ret;
-                    }
-                    phxfs_initialized[id] = true;
+    int ret = 0;
+
+    pthread_mutex_lock(&g_open_lock);
+
+    if (deviceID == -1) {
+        for (int id = 0; id < g_device_count; ++id) {
+            if (!phxfs_initialized[id]) {
+                ret = __phxfs_open(phxfs_dev_path[id].c_str(), &mbuffer[id]);
+                if (ret < 0) {
+                    phxfs_close_all();
+                    pthread_mutex_unlock(&g_open_lock);
+                    return ret;
                 }
-            }
-        } else if (deviceID >= 0 && deviceID < g_device_count) {
-            if (!phxfs_initialized[deviceID]) {
-                ret = __phxfs_open(phxfs_dev_path[deviceID].c_str(), &mbuffer[deviceID]);
-                phxfs_initialized[deviceID] = true;
-                return ret;
-            }
-        } else { // only start device id = 0
-            if (!phxfs_initialized[0]) {
-                ret = __phxfs_open(phxfs_dev_path[deviceID].c_str(), &mbuffer[0]);
-                phxfs_initialized[0] = true;
-                return ret;
+                phxfs_initialized[id] = true;
             }
         }
+    } else if (deviceID >= 0 && deviceID < g_device_count) {
+        if (!phxfs_initialized[deviceID]) {
+            ret = __phxfs_open(phxfs_dev_path[deviceID].c_str(),
+                               &mbuffer[deviceID]);
+            if (ret == 0)
+                phxfs_initialized[deviceID] = true;
+        }
+    } else {
+        ret = -1;  /* invalid device id */
     }
-    return 0;
+
+    pthread_mutex_unlock(&g_open_lock);
+    return ret;
 }
 
 
@@ -418,5 +427,166 @@ ssize_t phxfs_write(phxfs_fileid_t fid, void *buf, off_t buf_offset, ssize_t nby
         nbyte_total += ret;
     }
     return nbyte_total;
+}
+
+/* ------------------------------------------------------------------ *
+ * Batch I/O — engine selection + request resolution
+ * ------------------------------------------------------------------ */
+
+/*
+ * The batch engine is chosen once at library load (constructor below),
+ * not per call, so the hot path just reads a pointer. Preference order:
+ *   io_uring -> sync. (libaio slots in here later.)
+ * Never NULL: the sync engine always probes successfully.
+ */
+static const struct phxfs_io_engine *g_engine = nullptr;
+
+static void phxfs_io_engine_select(void) {
+    const struct phxfs_io_engine *candidates[] = {
+#ifdef PHXFS_HAVE_LIBURING
+        &phxfs_io_engine_uring,
+#endif
+        &phxfs_io_engine_sync,
+    };
+    for (const auto *e : candidates) {
+        if (e->probe && e->probe() == 0) {
+            g_engine = e;
+            return;
+        }
+    }
+    g_engine = &phxfs_io_engine_sync;  /* guaranteed fallback */
+}
+
+__attribute__((constructor))
+static void phxfs_io_engine_ctor(void) {
+    phxfs_io_engine_select();
+}
+
+const struct phxfs_io_engine *phxfs_io_engine_get(void) {
+    if (!g_engine)          /* defensive: constructor should have run */
+        phxfs_io_engine_select();
+    return g_engine;
+}
+
+const char *phxfs_io_engine_name(void) {
+    return phxfs_io_engine_get()->name;
+}
+
+/*
+ * Resolve a request's target buffer to a DMA-able host address.
+ *   - If (device_id, buf) matches a phxfs_regmem registration, use the
+ *     host-mapped P2P VMA (GPU path).
+ *   - Otherwise treat buf as an ordinary CPU address (host buffer path).
+ * Returns NULL only on an out-of-range registered buffer.
+ */
+static void *resolve_req_target(const phxfs_io_req_t *r) {
+    if (r->device_id >= 0 && r->device_id < g_device_count &&
+        phxfs_initialized[r->device_id]) {
+        phxfs_mmap_buffer_t *pb = &mbuffer[r->device_id];
+        phxfs_p2p_map_t *m = find_phxfs_mmap_node(pb, (u64)r->buf, r->nbytes);
+        if (m && m->has_reg) {
+            if ((size_t)(r->nbytes + r->buf_offset) > m->length)
+                return NULL;  /* out of range */
+            return (void *)((char *)m->vaddr + r->buf_offset);
+        }
+    }
+    /* Not a registered GPU buffer: plain CPU address. */
+    return (void *)((char *)r->buf + r->buf_offset);
+}
+
+/*
+ * NUMA node of a phxfs device, cached. Derived from the device's PCI BDF
+ * (exported by the kernel module at /sys/class/phxfs-generic/phxfs_devN/
+ * pci_bdf) -> /sys/bus/pci/devices/<bdf>/numa_node. Routing a batch to the
+ * pool on the target GPU's node avoids cross-NUMA DMA.
+ */
+static int g_dev_numa[PHXFS_MAX_DEVICES];
+static bool g_dev_numa_done[PHXFS_MAX_DEVICES] = {false};
+
+static int phxfs_dev_numa(int device_id) {
+    if (device_id < 0 || device_id >= PHXFS_MAX_DEVICES)
+        return 0;
+    if (g_dev_numa_done[device_id])
+        return g_dev_numa[device_id];
+
+    int node = 0;
+    char path[128], bdf[64] = {0};
+    snprintf(path, sizeof(path),
+             "/sys/class/phxfs-generic/phxfs_dev%d/pci_bdf", device_id);
+    FILE *f = fopen(path, "r");
+    if (f) {
+        if (fgets(bdf, sizeof(bdf), f)) {
+            char *nl = strchr(bdf, '\n');
+            if (nl) *nl = '\0';
+            char np[128];
+            snprintf(np, sizeof(np),
+                     "/sys/bus/pci/devices/%s/numa_node", bdf);
+            FILE *nf = fopen(np, "r");
+            if (nf) {
+                int v;
+                if (fscanf(nf, "%d", &v) == 1 && v >= 0)
+                    node = v;
+                fclose(nf);
+            }
+        }
+        fclose(f);
+    }
+    g_dev_numa[device_id] = node;
+    g_dev_numa_done[device_id] = true;
+    return node;
+}
+
+static int phxfs_batch(phxfs_io_req_t *reqs, int n, enum phxfs_io_op op) {
+    if (n <= 0)
+        return 0;
+
+    struct phxfs_io_op_req *ops =
+        (struct phxfs_io_op_req *)malloc((size_t)n * sizeof(*ops));
+    if (!ops)
+        return -ENOMEM;
+
+    /* Route to the NUMA node of the batch's target GPU (first request). */
+    int numa = phxfs_dev_numa(reqs[0].device_id);
+
+    int resolve_fail = 0;
+    for (int i = 0; i < n; i++) {
+        void *host = resolve_req_target(&reqs[i]);
+        if (!host) {
+            reqs[i].result = -EFAULT;
+            resolve_fail++;
+        }
+        ops[i].fd = reqs[i].fd;
+        ops[i].host_addr = host;
+        /* Unresolved -> nbytes 0 so the engine never dereferences NULL. */
+        ops[i].nbytes = host ? reqs[i].nbytes : 0;
+        ops[i].f_offset = reqs[i].f_offset;
+        ops[i].result = -EFAULT;
+    }
+
+    if (resolve_fail == n) {  /* nothing resolvable */
+        free(ops);
+        return resolve_fail;
+    }
+
+    int ret = phxfs_pool_run(ops, n, op, numa);
+
+    /* Copy engine results back (skip the unresolved ones). */
+    for (int i = 0; i < n; i++) {
+        if (ops[i].host_addr)
+            reqs[i].result = ops[i].result;
+    }
+    free(ops);
+
+    if (ret < 0)
+        return ret;
+    return ret + resolve_fail;
+}
+
+int phxfs_read_batch(phxfs_io_req_t *reqs, int n) {
+    return phxfs_batch(reqs, n, PHXFS_IO_READ);
+}
+
+int phxfs_write_batch(phxfs_io_req_t *reqs, int n) {
+    return phxfs_batch(reqs, n, PHXFS_IO_WRITE);
 }
 

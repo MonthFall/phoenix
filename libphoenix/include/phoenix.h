@@ -67,6 +67,47 @@ int phxfs_write_async(phxfs_fileid_t fid,
                       ssize_t *bytes_done,
                       void *stream);
 
+/* ------------------------------------------------------------------ *
+ * Batch I/O
+ *
+ * A single call submits N independent I/O requests to the underlying
+ * async engine (io_uring today; libaio / sync-fallback selected at
+ * runtime). This removes the per-request syscall overhead of looping
+ * over phxfs_read/phxfs_write, and lets the storage layer service the
+ * requests concurrently.
+ *
+ * Each request targets a buffer that may be either:
+ *   - a GPU buffer previously registered with phxfs_regmem (resolved to
+ *     its host-mapped P2P VMA internally), or
+ *   - an ordinary CPU buffer (e.g. pinned host memory used by a store
+ *     path). The engine handles both transparently.
+ * ------------------------------------------------------------------ */
+typedef struct phxfs_io_req {
+    int      fd;          /* open file descriptor (O_DIRECT recommended) */
+    int      device_id;   /* phxfs device the buf is registered on (GPU); */
+                          /* ignored for plain CPU buffers */
+    void    *buf;         /* GPU addr (registered) or CPU addr */
+    off_t    buf_offset;  /* byte offset within buf */
+    size_t   nbytes;      /* transfer length */
+    off_t    f_offset;    /* file offset */
+    ssize_t  result;      /* OUT: bytes transferred, or negative errno */
+} phxfs_io_req_t;
+
+/*
+ * Synchronous batch: submit all N requests, wait for completion, fill
+ * each req->result. Returns 0 if every request completed with
+ * result == nbytes; otherwise returns the number of failed requests
+ * (>0), or a negative value on a submission-level error.
+ */
+int phxfs_read_batch(phxfs_io_req_t *reqs, int n);
+int phxfs_write_batch(phxfs_io_req_t *reqs, int n);
+
+/*
+ * Name of the active I/O engine selected at runtime
+ * ("io_uring", "sync", ...). For diagnostics / tests.
+ */
+const char *phxfs_io_engine_name(void);
+
 #ifdef __cplusplus
 }
 #endif

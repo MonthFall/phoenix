@@ -22,3 +22,11 @@ add_dependencies (test_io libphoenix)
 target_include_directories (test_io PRIVATE "${phoenix_include}")
 target_link_libraries (test_io libphoenix CUDA::cudart)
 target_compile_definitions (test_io PRIVATE TEST_FILE="${TEST_FILE}")
+
+# --- test_batch: batch I/O (io_uring) correctness + performance ---
+find_package (Threads REQUIRED)
+add_executable (test_batch test_batch.cu)
+add_dependencies (test_batch libphoenix)
+target_include_directories (test_batch PRIVATE "${phoenix_include}")
+target_link_libraries (test_batch libphoenix CUDA::cudart Threads::Threads)
+target_compile_definitions (test_batch PRIVATE TEST_FILE="${TEST_FILE}")

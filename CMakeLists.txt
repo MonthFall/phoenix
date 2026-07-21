@@ -188,6 +188,12 @@ set(libphoenix_root "${PROJECT_SOURCE_DIR}/libphoenix")
 file(GLOB libphoenix_source "${libphoenix_root}/*.cpp")
 file(GLOB libphoenix_include "${libphoenix_root}/include/*.h")
 
+# io_engine_uring.cpp requires liburing; drop it when unavailable so the
+# sync fallback engine is still built.
+if (NOT LIBURING_FOUND)
+    list(REMOVE_ITEM libphoenix_source "${libphoenix_root}/io_engine_uring.cpp")
+endif ()
+
 # Select vendor-specific connector source file
 if (PHXFS_VENDOR STREQUAL "NVIDIA")
     set(devconn_source "${libphoenix_root}/connectors/nvidia_connector.cpp")
@@ -203,6 +209,13 @@ target_include_directories(libphoenix PRIVATE "${libphoenix_root}")
 
 if (PHXFS_VENDOR STREQUAL "NVIDIA")
     target_include_directories(libphoenix PRIVATE CUDA::cudart)
+endif ()
+
+# Link liburing for the io_uring batch engine when available.
+if (LIBURING_FOUND)
+    target_include_directories(libphoenix PRIVATE ${LIBURING_INCLUDE_DIRS})
+    target_link_libraries(libphoenix ${LIBURING_LIBRARIES})
+    target_link_directories(libphoenix PRIVATE ${LIBURING_LIBRARY_DIRS})
 endif ()
 # Set install locations
 install (FILES ${libphoenix_include} DESTINATION "include")
@@ -221,9 +234,8 @@ set (CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 # Benchmarks are not built (the directory is scheduled for removal).
 
-# Example and tests require CUDA (they use .cu files)
+# Tests require CUDA (they use .cu files)
 if (PHXFS_VENDOR STREQUAL "NVIDIA")
-    add_subdirectory ("${PROJECT_SOURCE_DIR}/example/")
     add_subdirectory ("${PROJECT_SOURCE_DIR}/test/")
 endif ()
 
