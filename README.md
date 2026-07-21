@@ -1,11 +1,10 @@
 # Phoenix
 
-**Direct I/O middleware from storage systems to xPU accelerators (GPU / NPU).**
+**An open-source, refactored GPU Direct Storage (GDS) I/O stack — without phony buffers.**
 
-Phoenix refactors the I/O stack for GPU Direct Storage so that data moves from storage straight into accelerator memory via DMA — **bypassing CPU host-memory bounce buffers** ("phony buffers"). AI applications integrate through adapters, getting I/O acceleration with minimal changes.
+Phoenix is a rebuilt version of GPU Direct Storage (GDS) that lets data flow straight from storage into GPU/NPU memory — faster, and easier to deploy than existing GDS. AI applications plug in through simple adapters.
 
-> 📄 Built on the SC'25 paper *"Phoenix: A Refactored I/O Stack for GPU Direct Storage without Phony Buffers"*.
-Phoenix is now a long-term open-source middleware for storage→xPU I/O, with adapters for AI data (vLLM done; lmcache planned).
+> 📄 Built on the SC'25 paper *"Phoenix: A Refactored I/O Stack for GPU Direct Storage without Phony Buffers"*. Phoenix is now a long-term open-source middleware for storage→xPU I/O, with adapters for AI data (vLLM done; lmcache planned).
 ## 📰 News
 
 
@@ -14,13 +13,13 @@ Phoenix is now a long-term open-source middleware for storage→xPU I/O, with ad
 
 ## What is Phoenix
 
-Phoenix is a direct hub between storage and xPU — accelerators (GPU/NPU) and AI apps plug in, and data streams straight through:
+By removing the phony buffer, Phoenix becomes a direct hub between storage and xPU — accelerators (GPU/NPU) and AI apps plug in, and data streams straight through:
 
 <p align="center">
   <img src="doc/phoenix-architecture.png" alt="Phoenix architecture: AI applications plug into the Phoenix hub, connecting storage to xPU accelerators" width="900">
 </p>
 
-The kernel module (`phxfs`) remaps GPU PCIe BAR memory and serves P2P mappings; the user library (`libphoenix`) and Python bindings expose simple registration/I/O APIs; adapters plug Phoenix into AI frameworks.
+The kernel module (`phxfs`) maps accelerator memory via `ZONE_DEVICE` and serves P2P mappings; the user library (`libphoenix`) exposes simple registration/I/O APIs; adapters (via pybind11) plug Phoenix into AI frameworks.
 
 ## Features & supported matrix
 
