@@ -103,6 +103,26 @@ int phxfs_read_batch(phxfs_io_req_t *reqs, int n);
 int phxfs_write_batch(phxfs_io_req_t *reqs, int n);
 
 /*
+ * Asynchronous batch — submit returns immediately after queuing the batch
+ * on the internal NUMA pool; the caller can run GPU compute meanwhile, then
+ * call phxfs_batch_wait() to block for completion and get per-request
+ * results. Enables compute/I/O overlap.
+ *
+ *   reqs MUST remain valid until phxfs_batch_wait() returns.
+ *   At most one async batch may be in flight per NUMA node (the batch owns
+ *   that node's pool between submit and wait).
+ *
+ * phxfs_batch_submit_read/write return an opaque handle (NULL on error).
+ * phxfs_batch_wait returns the number of failed requests (>=0), or negative
+ * on error, and frees the handle.
+ */
+typedef struct phxfs_batch phxfs_batch_t;
+
+phxfs_batch_t *phxfs_batch_submit_read(phxfs_io_req_t *reqs, int n);
+phxfs_batch_t *phxfs_batch_submit_write(phxfs_io_req_t *reqs, int n);
+int phxfs_batch_wait(phxfs_batch_t *handle);
+
+/*
  * Name of the active I/O engine selected at runtime
  * ("io_uring", "sync", ...). For diagnostics / tests.
  */

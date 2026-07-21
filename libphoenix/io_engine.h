@@ -85,7 +85,14 @@ extern const struct phxfs_io_engine phxfs_io_engine_uring;
 int phxfs_pool_run(struct phxfs_io_op_req *reqs, int n, enum phxfs_io_op op,
                    int numa_node);
 
-/* Opaque async handle for submit/wait (compute–I/O overlap). */
-struct phxfs_batch_handle;
+/*
+ * Async pool primitives (compute–I/O overlap). submit returns immediately;
+ * the batch owns the node's pool until wait() completes it. `reqs` must
+ * stay alive until wait() returns.
+ */
+struct phxfs_pool_async;  /* opaque */
+struct phxfs_pool_async *phxfs_pool_submit(struct phxfs_io_op_req *reqs, int n,
+                                           enum phxfs_io_op op, int numa_node);
+int phxfs_pool_wait(struct phxfs_pool_async *h);
 
 #endif /* __PHXFS_IO_ENGINE_H__ */

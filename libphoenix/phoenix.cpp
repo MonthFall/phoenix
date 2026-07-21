@@ -590,3 +590,80 @@ int phxfs_write_batch(phxfs_io_req_t *reqs, int n) {
     return phxfs_batch(reqs, n, PHXFS_IO_WRITE);
 }
 
+/* ------------------------------------------------------------------ *
+ * Async batch (compute/I/O overlap)
+ * ------------------------------------------------------------------ */
+struct phxfs_batch {
+    struct phxfs_pool_async *pool_h;   /* internal pool handle */
+    struct phxfs_io_op_req  *ops;      /* resolved requests (kept alive) */
+    phxfs_io_req_t          *reqs;     /* user array, for result copy-back */
+    int                      n;
+    int                      resolve_fail;
+};
+
+static phxfs_batch_t *phxfs_batch_submit(phxfs_io_req_t *reqs, int n,
+                                         enum phxfs_io_op op) {
+    if (n <= 0)
+        return NULL;
+
+    phxfs_batch_t *h = (phxfs_batch_t *)calloc(1, sizeof(*h));
+    if (!h)
+        return NULL;
+
+    h->ops = (struct phxfs_io_op_req *)malloc((size_t)n * sizeof(*h->ops));
+    if (!h->ops) {
+        free(h);
+        return NULL;
+    }
+    h->reqs = reqs;
+    h->n = n;
+
+    int numa = phxfs_dev_numa(reqs[0].device_id);
+
+    h->resolve_fail = 0;
+    for (int i = 0; i < n; i++) {
+        void *host = resolve_req_target(&reqs[i]);
+        if (!host) {
+            reqs[i].result = -EFAULT;
+            h->resolve_fail++;
+        }
+        h->ops[i].fd = reqs[i].fd;
+        h->ops[i].host_addr = host;
+        h->ops[i].nbytes = host ? reqs[i].nbytes : 0;
+        h->ops[i].f_offset = reqs[i].f_offset;
+        h->ops[i].result = -EFAULT;
+    }
+
+    h->pool_h = phxfs_pool_submit(h->ops, n, op, numa);
+    if (!h->pool_h) {
+        free(h->ops);
+        free(h);
+        return NULL;
+    }
+    return h;
+}
+
+phxfs_batch_t *phxfs_batch_submit_read(phxfs_io_req_t *reqs, int n) {
+    return phxfs_batch_submit(reqs, n, PHXFS_IO_READ);
+}
+
+phxfs_batch_t *phxfs_batch_submit_write(phxfs_io_req_t *reqs, int n) {
+    return phxfs_batch_submit(reqs, n, PHXFS_IO_WRITE);
+}
+
+int phxfs_batch_wait(phxfs_batch_t *h) {
+    if (!h)
+        return -EINVAL;
+
+    int ret = phxfs_pool_wait(h->pool_h);
+
+    for (int i = 0; i < h->n; i++) {
+        if (h->ops[i].host_addr)
+            h->reqs[i].result = h->ops[i].result;
+    }
+    free(h->ops);
+    int rc = (ret < 0) ? ret : ret + h->resolve_fail;
+    free(h);
+    return rc;
+}
+

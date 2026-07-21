@@ -216,3 +216,95 @@ int phxfs_pool_run(struct phxfs_io_op_req *reqs, int n, enum phxfs_io_op op,
     pthread_mutex_unlock(&g_call_lock);
     return failed;
 }
+
+/* ------------------------------------------------------------------ *
+ * Async: submit returns immediately, wait blocks for completion.
+ *
+ * One batch owns the pool between submit and wait (g_call_lock is held
+ * across the pair), so at most one async batch is in flight per node —
+ * exactly the compute-overlap model requested. The handle records which
+ * node/stride to join.
+ * ------------------------------------------------------------------ */
+struct phxfs_pool_async {
+    int node;
+    int stride;
+    bool inline_done;   /* ran inline (pool unavailable) */
+    int inline_failed;
+};
+
+struct phxfs_pool_async *phxfs_pool_submit(struct phxfs_io_op_req *reqs, int n,
+                                           enum phxfs_io_op op, int numa_node) {
+    struct phxfs_pool_async *h =
+        (struct phxfs_pool_async *)calloc(1, sizeof(*h));
+    if (!h)
+        return NULL;
+
+    pthread_once(&g_once, pool_init);
+    if (numa_node < 0 || numa_node >= g_num_nodes)
+        numa_node = 0;
+    h->node = numa_node;
+    struct node_pool *p = &g_pools[numa_node];
+
+    if (n <= 0) {
+        h->inline_done = true;
+        h->inline_failed = 0;
+        return h;
+    }
+    if (!g_pool_ready || p->nthreads <= 0) {
+        const struct phxfs_io_engine *eng = phxfs_io_engine_get();
+        h->inline_done = true;
+        h->inline_failed = eng->submit_batch(reqs, n, op);
+        return h;
+    }
+
+    /* Acquire the pool for this batch; released in phxfs_pool_wait. */
+    pthread_mutex_lock(&g_call_lock);
+
+    int stride = p->nthreads;
+    if (stride > n)
+        stride = n;
+    h->stride = stride;
+
+    pthread_mutex_lock(&p->mtx);
+    for (int t = 0; t < stride; t++) {
+        p->workers[t].reqs = reqs;
+        p->workers[t].n = n;
+        p->workers[t].stride = stride;
+        p->workers[t].op = op;
+        p->workers[t].failed = 0;
+    }
+    p->pending = stride;
+    p->active = true;
+    p->generation++;
+    pthread_cond_broadcast(&p->work_cv);
+    pthread_mutex_unlock(&p->mtx);
+    /* NOTE: g_call_lock stays held until wait(). */
+    return h;
+}
+
+int phxfs_pool_wait(struct phxfs_pool_async *h) {
+    if (!h)
+        return -EINVAL;
+
+    int failed;
+    if (h->inline_done) {
+        failed = h->inline_failed;
+        free(h);
+        return failed;
+    }
+
+    struct node_pool *p = &g_pools[h->node];
+    pthread_mutex_lock(&p->mtx);
+    while (p->pending > 0)
+        pthread_cond_wait(&p->done_cv, &p->mtx);
+    p->active = false;
+    pthread_mutex_unlock(&p->mtx);
+
+    failed = 0;
+    for (int t = 0; t < h->stride; t++)
+        failed += p->workers[t].failed;
+
+    pthread_mutex_unlock(&g_call_lock);  /* release the pool */
+    free(h);
+    return failed;
+}

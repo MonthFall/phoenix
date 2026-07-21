@@ -122,6 +122,24 @@ static void correctness(const char *base_file) {
     }
     CHECK(ret == 0 && scat_bad == 0, "scattered-offset batch correct (%zu bad chunks)", scat_bad);
 
+    // async submit/wait: submit, do (dummy) compute, then wait + verify.
+    cudaMemset(gbuf, 0, buf_bytes); cudaStreamSynchronize(0);
+    for (int i = 0; i < REQS; i++) {
+        reqs[i].buf_offset = (off_t)i * CHUNK;
+        reqs[i].f_offset   = (off_t)i * CHUNK;
+    }
+    phxfs_batch_t *h = phxfs_batch_submit_read(reqs.data(), REQS);
+    CHECK(h != nullptr, "phxfs_batch_submit_read returned a handle");
+    volatile double spin = 0;              // stand-in for overlapping compute
+    for (int k = 0; k < 1000000; k++) spin += k * 0.5;
+    int aret = h ? phxfs_batch_wait(h) : -1;
+    CHECK(aret == 0, "phxfs_batch_wait returned %d (0 = all ok)", aret);
+    cudaMemcpy(hbuf, gbuf, buf_bytes, cudaMemcpyDeviceToHost); cudaStreamSynchronize(0);
+    size_t amis = 0;
+    for (size_t o = 0; o < buf_bytes; o++)
+        if (hbuf[o] != (uint8_t)(o & 0xff)) { amis++; }
+    CHECK(amis == 0, "async batch per-byte verify: %zu mismatch(es)", amis);
+
     close(dfd); phxfs_deregmem(dev, gbuf, buf_bytes); phxfs_close(dev);
     cudaFree(gbuf); free(hbuf);
 }
