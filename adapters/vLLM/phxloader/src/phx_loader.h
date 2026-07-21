@@ -14,7 +14,8 @@
 extern "C" {
 int phxfs_open(int device_id);
 int phxfs_close(int device_id);
-int phxfs_find_dev_for_cuda_gpu(int cuda_gpu_id);
+int phxfs_find_dev(int device_id);
+uint64_t phxfs_get_page_size(void);
 ssize_t phxfs_read(struct phxfs_fileid fid, void *buf, off_t buf_offset,
                     ssize_t nbyte, off_t f_offset);
 int phxfs_regmem(int device_id, const void *addr, size_t len,
@@ -24,7 +25,7 @@ int phxfs_deregmem(int device, const void *addr, size_t len);
 
 class PhxLoader {
 public:
-    explicit PhxLoader(int cuda_device_id);
+    explicit PhxLoader(int device_id);
     ~PhxLoader();
 
     // Non-copyable
@@ -67,7 +68,7 @@ public:
 
 private:
     int dev_;            // phxfs device id
-    int cuda_device_;    // original CUDA device id
+    int device_id_;      // original vendor device id
     bool initialized_;
 
     // Tracks registered memory: gpu_ptr -> (aligned_size, cpu_target_addr)

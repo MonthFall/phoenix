@@ -11,7 +11,6 @@ import torch
 
 # Alignment constants
 PAGE_SIZE = 4096
-GPU_PAGE_SIZE = 64 * 1024  # 64K, required by phxfs_regmem
 
 # Type alias: name -> (dtype, shape, data_start_in_data_section, nbytes)
 TensorMeta = Dict[str, Tuple[torch.dtype, Tuple[int, ...], int, int]]

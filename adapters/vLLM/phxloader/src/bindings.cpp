@@ -6,11 +6,11 @@
 namespace py = pybind11;
 
 PYBIND11_MODULE(_phxloader, m) {
-    m.doc() = "Phoenix DMA loader for GPU Direct Storage";
+    m.doc() = "Phoenix DMA loader for direct storage";
 
     py::class_<PhxLoader>(m, "PhxLoader")
         .def(py::init<int>(),
-             py::arg("cuda_device_id"))
+             py::arg("device_id"))
         .def("regmem",
              [](PhxLoader &self, uintptr_t gpu_ptr, size_t size) -> uintptr_t {
                  void *ptr = reinterpret_cast<void *>(gpu_ptr);

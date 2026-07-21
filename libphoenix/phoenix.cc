@@ -167,6 +167,10 @@ int phxfs_find_dev(int device_id) {
     return devconn->find_device(device_id);
 }
 
+uint64_t phxfs_get_page_size(void) {
+    return devconn->page_size;
+}
+
 
 int insert_phxfs_mmap_node(phxfs_mmap_buffer_t *mbuffer, phxfs_p2p_map_t *new_node) {
     if (!new_node) {

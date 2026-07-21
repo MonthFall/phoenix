@@ -27,6 +27,9 @@ typedef struct phxfs_fileid {
 int phxfs_open(int device_id);
 int phxfs_close(int device_id);
 
+/* Returns the device page size in bytes (NVIDIA=64KB, etc.). */
+uint64_t phxfs_get_page_size(void);
+
 /*
  * Map a vendor-specific device ID to a phxfs device index.
  * The vendor is selected at build time (PHXFS_VENDOR).
