@@ -1,6 +1,5 @@
 #include <cstddef>
 #include <cstdint>
-#include <cuda_runtime.h>
 #ifdef PHXFS_HAVE_LIBURING
 #include <liburing.h>
 #endif
@@ -8,6 +7,7 @@
 #include <unistd.h>
 
 #include "phoenix.h"
+#include "connectors/devconnector.h"
 
 
 enum phxfs_op {
@@ -24,9 +24,8 @@ struct phxfs_data {
     ssize_t *bytes_done;
 };
 
-// Runs on the CUDA stream's host-callback thread. Reuses the synchronous
-// phxfs_read/write (single contiguous mapping + per-syscall chunking).
-void CUDART_CB phxfs_callback(void *user_data){
+/* Callback executed on the stream's host-callback thread. */
+static void phxfs_callback(void *user_data) {
     auto* data = static_cast<phxfs_data*>(user_data);
     if (data->op == PHXFS_OP_READ)
         *data->bytes_done = phxfs_read(data->fid, data->buf, 0, (ssize_t)data->nbytes, data->file_offset);
@@ -35,32 +34,31 @@ void CUDART_CB phxfs_callback(void *user_data){
     delete data;
 }
 
-
-cudaError_t phxfs_async(phxfs_fileid_t fid, enum phxfs_op op,
-                            void* buf,
-                            size_t nbytes, off_t offset,
-                            ssize_t *bytes_done,
-                            CUstream stream){
+int phxfs_async(phxfs_fileid_t fid, enum phxfs_op op,
+                void *buf,
+                size_t nbytes, off_t offset,
+                ssize_t *bytes_done,
+                void *stream) {
     auto* data = new phxfs_data{
         .fid = fid, .op = op, .buf = buf,
         .nbytes = nbytes, .file_offset = offset,
         .bytes_done = bytes_done
     };
-    return cudaLaunchHostFunc(stream, phxfs_callback, data);
+    return devconn->launch_async(stream, phxfs_callback, data);
 }
 
-cudaError_t phxfs_read_async(phxfs_fileid_t fid,
-                            void* buf,
-                            size_t nbytes, off_t offset,
-                            ssize_t *bytes_done,
-                            CUstream stream) {
+int phxfs_read_async(phxfs_fileid_t fid,
+                     void *buf,
+                     size_t nbytes, off_t offset,
+                     ssize_t *bytes_done,
+                     void *stream) {
     return phxfs_async(fid, PHXFS_OP_READ, buf, nbytes, offset, bytes_done, stream);
 }
 
-cudaError_t phxfs_write_async(phxfs_fileid_t fid,
-                             void* buf, 
-                             size_t nbytes, off_t offset,
-                             ssize_t* bytes_done,
-                             CUstream stream) {
+int phxfs_write_async(phxfs_fileid_t fid,
+                      void *buf,
+                      size_t nbytes, off_t offset,
+                      ssize_t *bytes_done,
+                      void *stream) {
     return phxfs_async(fid, PHXFS_OP_WRITE, buf, nbytes, offset, bytes_done, stream);
 }

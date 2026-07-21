@@ -1,19 +1,31 @@
 cmake_minimum_required (VERSION 3.18)
 
-set (CMAKE_CUDA_ARCHITECTURES 90)
+# Vendor selection must be set before project() so we can conditionally
+# enable the CUDA language.
+set (PHXFS_VENDOR "NVIDIA" CACHE STRING "Target GPU vendor: NVIDIA, AMD, HUAWEI")
+set_property (CACHE PHXFS_VENDOR PROPERTY STRINGS NVIDIA AMD HUAWEI)
 
-project (libphoenix LANGUAGES CUDA C CXX)
+if (PHXFS_VENDOR STREQUAL "NVIDIA")
+    project (libphoenix LANGUAGES CUDA C CXX)
+    set (CMAKE_CUDA_ARCHITECTURES 90)
+    set (CMAKE_CUDA_STANDARD 20)
+else ()
+    project (libphoenix LANGUAGES C CXX)
+endif ()
 
 set (CMAKE_C_STANDARD 99)
 set (CMAKE_CXX_STANDARD 20)
 set (CMAKE_CXX_STANDARD_REQUIRED ON)
-set (CMAKE_CUDA_STANDARD 20)
 
 find_package (Threads REQUIRED)
-find_package (CUDA 12.4 REQUIRED)
-find_package (CUDAToolkit REQUIRED)
-find_library (CUFILE_LIBRARIES cufile ${CUDA_TOOLKIT_ROOT_DIR}/lib64)
 find_library (DL_LIB dl REQUIRED)
+
+# CUDA is only required for NVIDIA vendor
+if (PHXFS_VENDOR STREQUAL "NVIDIA")
+    find_package (CUDA 12.4 REQUIRED)
+    find_package (CUDAToolkit REQUIRED)
+    find_library (CUFILE_LIBRARIES cufile ${CUDA_TOOLKIT_ROOT_DIR}/lib64)
+endif ()
 
 find_package(PkgConfig REQUIRED)
 
@@ -39,13 +51,7 @@ set (KERNEL "/lib/modules/${CMAKE_SYSTEM_VERSION}/build" CACHE PATH "Path to ker
 
 set (nvidia_archs "90" CACHE STRING "NVIDIA compute architectures")
 set (no_module false CACHE BOOL "Do not build kernel module")
-set (no_cuda false CACHE BOOL "Do not build library with CUDA support")
 set (BUILD_SHARED_LIBS true CACHE BOOL "Build shared library, set to false for static")
-
-# Kernel module: target GPU vendor (single-vendor-per-machine).
-# This selects which P2P backend is compiled into the module.
-set (PHXFS_VENDOR "NVIDIA" CACHE STRING "Target GPU vendor for kernel module: NVIDIA, AMD, HUAWEI")
-set_property (CACHE PHXFS_VENDOR PROPERTY STRINGS NVIDIA AMD HUAWEI)
 
 if (no_smartio)
     set (no_smartio_samples true)
@@ -87,8 +93,11 @@ if (no_cc)
     set(CCUDA_NVCC_FLAGS "${CMAKE_C_FLAGS} -D__NO_COHERENCE__")
 endif ()
 
-include_directories ("${PROJECT_SOURCE_DIR}/libphoenix/include"
-                    "${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/include/")
+include_directories ("${PROJECT_SOURCE_DIR}/libphoenix/include")
+
+if (PHXFS_VENDOR STREQUAL "NVIDIA")
+    include_directories ("${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/include/")
+endif ()
 
 # Set vendor-specific backend object file and compile define
 if (PHXFS_VENDOR STREQUAL "NVIDIA")
@@ -179,9 +188,22 @@ set(libphoenix_root "${PROJECT_SOURCE_DIR}/libphoenix")
 file(GLOB libphoenix_source "${libphoenix_root}/*.cc")
 file(GLOB libphoenix_include "${libphoenix_root}/include/*.h")
 
-add_library(libphoenix ${libphoenix_source} ${libphoenix_include})
+# Select vendor-specific connector source file
+if (PHXFS_VENDOR STREQUAL "NVIDIA")
+    set(devconn_source "${libphoenix_root}/connectors/nvidia_connector.cc")
+elseif (PHXFS_VENDOR STREQUAL "AMD")
+    set(devconn_source "${libphoenix_root}/connectors/amd_connector.cc")
+elseif (PHXFS_VENDOR STREQUAL "HUAWEI")
+    set(devconn_source "${libphoenix_root}/connectors/huawei_connector.cc")
+endif ()
+
+add_library(libphoenix ${libphoenix_source} ${devconn_source} ${libphoenix_include})
 set_target_properties (libphoenix PROPERTIES OUTPUT_NAME "phoenix")
-target_include_directories(libphoenix PRIVATE "${libphoenix_root}" CUDA::cudart)
+target_include_directories(libphoenix PRIVATE "${libphoenix_root}")
+
+if (PHXFS_VENDOR STREQUAL "NVIDIA")
+    target_include_directories(libphoenix PRIVATE CUDA::cudart)
+endif ()
 # Set install locations
 install (FILES ${libphoenix_include} DESTINATION "include")
 install (TARGETS libphoenix DESTINATION "lib")
@@ -199,6 +221,9 @@ set (CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 # Benchmarks are not built (the directory is scheduled for removal).
 
-add_subdirectory ("${PROJECT_SOURCE_DIR}/example/")
-add_subdirectory ("${PROJECT_SOURCE_DIR}/test/")
+# Example and tests require CUDA (they use .cu files)
+if (PHXFS_VENDOR STREQUAL "NVIDIA")
+    add_subdirectory ("${PROJECT_SOURCE_DIR}/example/")
+    add_subdirectory ("${PROJECT_SOURCE_DIR}/test/")
+endif ()
 
