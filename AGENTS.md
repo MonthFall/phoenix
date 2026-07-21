@@ -4,20 +4,18 @@ This file is the **single entry point** for AI agents working in this repository
 
 ## What this project is
 
-Phoenix is middleware for **direct I/O from storage to xPU (GPU/NPU)** via DMA, bypassing CPU host memory ("phony buffers"). Three layers: a Linux kernel module (`phxfs`), a user-space library (`libphoenix`) + Python bindings, and application **adapters** (vLLM done; lmcache planned).
+Phoenix is middleware for **direct I/O from storage to xPU (GPU/NPU)** via DMA, bypassing CPU host memory ("phony buffers"). Three layers: a Linux kernel module (`phxfs`), a user-space library (`libphoenix`), and application **adapters** (vLLM done via pybind11; lmcache planned). Multi-vendor support (NVIDIA/AMD/Huawei) is selected at build time via `PHXFS_VENDOR`; only NVIDIA is implemented today, but the backend interfaces are vendor-agnostic.
 
 ## Directory map (responsibilities)
 
 | Path | Role |
 | --- | --- |
-| `module/` | `phxfs` kernel module — GPU BAR remap, per-GPU char device, `mmap`/`ioctl` P2P mapping |
-| `libphoenix/` | User C/C++ lib — `phxfs_open/close`, `regmem/deregmem`, `read/write`, async (`integration.cc`) |
-| `python/` | `phxfs` ctypes Python package |
-| `adapters/vllm/phxloader/` | vLLM weight loader (safetensors → GPU DMA), published `phxloader` pkg |
+| `module/` | `phxfs` kernel module — GPU BAR remap, per-GPU char device, `mmap`/`ioctl` P2P mapping; `phxfs-backend.*` + `nvidia-backend.c` select the P2P backend |
+| `libphoenix/` | User C/C++ lib — `phxfs_open/close`, `regmem/deregmem`, `read/write`, async (`integration.cpp`); `connectors/` holds the vendor `DevConnector` (`nvidia_connector.cpp`) |
+| `adapters/vLLM/phxloader/` | vLLM weight loader (safetensors → GPU DMA) via pybind11, published `phxloader` pkg |
 | `adapters/lmcache/` | (roadmap) KV-cache acceleration |
 | `example/` | Minimal end-to-end example |
-| `benchmarks/` | Perf binaries: breakdown, end-to-end, kvcache, micro, safetensor |
-| `tests/` | Correctness tests (`.cu`) |
+| `test/` | Correctness + performance tests (`test_regmem`, `test_io`) |
 | `scripts/` | Helper/eval scripts (paths are env-specific — users must edit) |
 | `third-party/fio/` | fio submodule for I/O testing |
 | `doc/` | All documentation (index: `doc/README.md`) |
@@ -26,20 +24,22 @@ Phoenix is middleware for **direct I/O from storage to xPU (GPU/NPU)** via DMA, 
 
 ```shell
 # prerequisites: NVIDIA GDS + MLNX_OFED, kernel source for running kernel, CUDA 12.4, liburing
-mkdir -p build && cd build && cmake ../ && make -j
+mkdir -p build && cd build && cmake ../ && make -j    # default vendor: NVIDIA
 sudo make insmod          # insert kernel module (run `nvidia-smi` first)
 sudo make rmmod           # remove
-ctest                     # (if enabled) run tests
+./bin/test_regmem 0       # memory registration lifecycle tests
+./bin/test_io 0           # I/O correctness + performance tests
 ```
 Skip the module: `cmake -Dno_module=true ../`.
+Target a different vendor: `cmake -DPHXFS_VENDOR=AMD ../` (requires implementing `module/amd-backend.c` + `libphoenix/connectors/amd_connector.cpp` first).
 
 ## Common tasks
 
-**Kernel module work** — edit under `module/`; rebuild with `make` in `build/`; `sudo make insmod`. Watch `dmesg` for `phxfs*` messages. If `insmod` fails with "Operation not permitted", the GPU BAR is held by another process/driver (see `doc/troubleshooting.md`).
+**Kernel module work** — edit under `module/`; rebuild with `make` in `build/`; `sudo make insmod`. Watch `dmesg` for `phxfs*` messages. If `insmod` fails with "Operation not permitted", the GPU BAR is held by another process/driver (see `doc/troubleshooting.md`). Vendor-specific P2P calls live only in `<vendor>-backend.c`; core files (`phxfs.c`, `phxfs-mem.c`, `phxfs-p2p-service.c`) call through the `phxfs_p2p` function-pointer table and must stay vendor-agnostic.
 
-**Library / API work** — edit `libphoenix/`; `libphoenix.so` is consumed by `python/` (ctypes) and adapters.
+**Library / API work** — edit `libphoenix/`; `libphoenix.so` is consumed by adapters via pybind11. Vendor-specific calls (CUDA, HIP, ...) live only in `libphoenix/connectors/<vendor>_connector.cpp`; core files (`phoenix.cpp`, `integration.cpp`) call through the `devconn` function-pointer table and must stay vendor-agnostic.
 
-**App integration** — vLLM: `adapters/vllm/phxloader` exposes `PhxLoader` and a `phxsafetensors` load_format. New adapters register a GPU buffer via `libphoenix` and DMA through `phxfs_read`/`phxfs_write`.
+**App integration** — vLLM: `adapters/vLLM/phxloader` exposes `PhxLoader` and a `phxsafetensors` load_format. New adapters register a GPU buffer via `libphoenix` and DMA through `phxfs_read`/`phxfs_write`.
 
 **Bug reporting** — run `bash scripts/collect_bug_info.sh` to produce a structured report, then open an issue using `.github/ISSUE_TEMPLATE/bug_report.md`.
 
@@ -47,8 +47,8 @@ Skip the module: `cmake -Dno_module=true ../`.
 
 - **BAR exclusivity**: only one driver may own the GPU PCIe BAR. Phoenix must be inserted when no other process/driver uses it.
 - **Registration size limit**: `regmem` > 32 GiB still fails (mapping descriptor uses `kmalloc`). Large transfers are chunked at `PHXFS_IO_CHUNK` (1 GiB) for `read`/`write` to stay under `MAX_RW_COUNT`.
-- **Async I/O**: current async path is `cudaLaunchHostFunc + pread/pwrite`, **not** `io_uring` yet (planned).
-- **NPU**: code is NVIDIA-only today; NPU support is research, not implemented.
+- **Async I/O**: current async path is `cudaLaunchHostFunc + pread/pwrite` (via `devconn->launch_async`), **not** `io_uring` yet (planned).
+- **Single vendor per machine**: only one `PHXFS_VENDOR` backend is compiled in; mixed-vendor machines are not supported.
 - **Scripts are env-specific**: `scripts/*.sh`/`*.py` hardcode dataset paths (e.g. `/home/sc25/...`); they need editing per environment and are not part of the build.
 
 ## Where to look

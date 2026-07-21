@@ -45,9 +45,11 @@ mkdir -p build && cd build
 cmake ../
 make -j
 ```
-This compiles the user library, the `phxfs` kernel module, and the benchmarks.
+This compiles the user library, the `phxfs` kernel module, the example, and the tests.
 
 To skip the kernel module: `cmake -Dno_module=true ../`.
+
+To target a different accelerator vendor: `cmake -DPHXFS_VENDOR=AMD ../` (default is `NVIDIA`).
 
 ## 5. Install the kernel module
 
@@ -58,10 +60,18 @@ Run `nvidia-smi` first to `modprobe` the NVIDIA driver. If installation fails, s
 
 ## 6. Quick demo
 
-A minimal end-to-end example lives in `example/example.cc`. Build it via the top-level CMake (target `example`) and run:
+A minimal end-to-end example lives in `example/example.cpp`. Build it via the top-level CMake (target `example`) and run:
 
 ```shell
 cd build && sudo ./bin/example <file_path> <io_size> <mode>
+```
+
+## 7. Run tests
+
+```shell
+cd build
+./bin/test_regmem 0   # memory registration lifecycle
+./bin/test_io 0        # I/O correctness + performance
 ```
 
 For vLLM weight loading, install the adapter and set `--load-format phxsafetensors` (see [adapters.md](adapters.md)).

@@ -41,12 +41,6 @@ struct phxfs_bar_segment {
 	struct pci_p2pdma_pagemap *p2p_pgmap;
 };
 
-struct pci_p2pdma {
-    struct gen_pool *pool;
-    bool p2pmem_published;
-    struct xarray map_types;
-};
-
 struct pci_p2pdma_pagemap {
     struct dev_pagemap pgmap;
     struct pci_dev provider;
@@ -65,10 +59,8 @@ struct phxfs_dev {
     struct cdev cdev;
     int idx;
     struct pci_p2pdma_pagemap *p2p_pgmap; /* legacy single-segment pgmap (kept for compat) */
-    void *dev_remap_addr;
     void __iomem *pci_mem_va; /* legacy single-segment VA (kept for compat) */
     bool remap;
-    unsigned int dev_page_size;
     struct phxfs_bar_segment *segments; /* dynamically allocated segment array */
     int num_segments;    /* number of successfully mapped segments */
 };
@@ -76,16 +68,6 @@ struct phxfs_dev {
 struct phxfs_ctrl {
     struct phxfs_dev phx_dev[MAX_DEV_NUM];
     int dev_num;
-};
-
-struct find_info {
-    void __iomem *start;
-    char *target;
-    u64 len;
-    u64 result;
-    u64 offset;
-    int thread_id;
-    bool found;
 };
 
 /* P2P mapping descriptor (vendor-agnostic) */
@@ -112,7 +94,6 @@ struct p2p_vmap {
 struct phxfs_dev_info_s {
     u64 dev_id;
 } __attribute__((packed, aligned(8)));
-typedef struct phxfs_dev_info_s phx_dev_info_t;
 
 struct phxfs_ioctl_map_s {
     struct phxfs_dev_info_s dev;
@@ -154,14 +135,5 @@ typedef union phxfs_ioctl_para_s phxfs_ioctl_para_t;
 #define PHXFS_IOCTL_UNMAP _IOW(PHXFS_IOCTL, 2, struct phxfs_ioctl_map_s)
 
 void phxfs_map_dev_release(phxfs_ioctl_map_t *map_param, u64 devaddr, u64 dev_len, u64 cpuvaddr, u64 length);
-
-struct devmm_svm_process_id {
-    int32_t hostpid;
-    union {
-        uint16_t devid;
-        uint16_t vm_id;
-    };
-    uint16_t vfid;
-};
 
 #endif

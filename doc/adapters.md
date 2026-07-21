@@ -1,6 +1,6 @@
 # Adapters
 
-Adapters connect Phoenix to AI applications. Each adapter depends on `libphoenix` (and optionally the Python bindings) to perform direct storage→xPU transfers for a specific framework.
+Adapters connect Phoenix to AI applications. Each adapter depends on `libphoenix` (via `pybind11` bindings) to perform direct storage→xPU transfers for a specific framework.
 
 ## vLLM — `phxloader` (available)
 
@@ -39,7 +39,7 @@ llm = LLM(model="...", load_format="phxsafetensors")
 ```python
 from phxloader import PhxLoader
 
-loader = PhxLoader(cuda_device_id=0)
+loader = PhxLoader(device_id=0)
 loader.regmem(gpu_ptr, size)
 loader.load_tensors_into_buffer(path, gpu_ptr, batch)        # synchronous
 loader.load_tensors_into_buffer_async(path, gpu_ptr, batch)  # background DMA

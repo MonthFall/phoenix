@@ -2,6 +2,12 @@
 
 `libphoenix` is the user-space C/C++ library that simplifies interaction with the `phxfs` kernel module. It manages device metadata and GPU buffer registration/unregistration.
 
+## Multi-vendor DevConnector
+
+Vendor-specific calls (device discovery via CUDA/HIP/CANN, async stream launch) are abstracted behind `struct devconn_ops` (`libphoenix/connectors/devconnector.h`). The active connector is selected at **compile time** via `PHXFS_VENDOR` (default `NVIDIA`) and exposed through the global `devconn` pointer. Core files (`phoenix.cpp`, `integration.cpp`) call only through `devconn->find_device()` / `launch_async()` / `page_size` and never include vendor headers (e.g. `cuda.h`).
+
+`libphoenix/connectors/nvidia_connector.cpp` implements the NVIDIA connector. Adding a new vendor means writing `<vendor>_connector.cpp` and pointing `devconn` at it; no other user-library file needs to change.
+
 ## Driver management
 
 ### `phxfs_open`
@@ -46,4 +52,8 @@ Unregisters a previously registered region: removes the kernel mapping via `ioct
 
 ## I/O
 
-`phxfs_read` / `phxfs_write` transfer data directly between a file descriptor and the registered (GPU-backed) VMA. Large transfers are chunked at `PHXFS_IO_CHUNK` (1 GiB) to stay under the kernel's `MAX_RW_COUNT`. Asynchronous I/O via `io_uring` is on the [roadmap](roadmap.md).
+`phxfs_read` / `phxfs_write` transfer data directly between a file descriptor and the registered (GPU-backed) VMA. Large transfers are chunked at `PHXFS_IO_CHUNK` (1 GiB) to stay under the kernel's `MAX_RW_COUNT`.
+
+### Async I/O
+
+`phxfs_read_async` / `phxfs_write_async` accept a vendor-agnostic `void *stream` handle and launch the transfer via `devconn->launch_async()` (e.g. `cudaLaunchHostFunc` for NVIDIA). If no connector supports async launch, the call falls back to synchronous execution. Native `io_uring` support is on the [roadmap](roadmap.md).

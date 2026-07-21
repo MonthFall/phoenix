@@ -14,19 +14,19 @@ Phoenix is now a long-term open-source middleware for storage→xPU I/O, with ad
 
 ## What is Phoenix
 
-Phoenix is a thin middleware layer between storage and accelerators:
+Phoenix is a direct hub between storage and xPU — accelerators (GPU/NPU) and AI apps plug in, and data streams straight through:
 
 ```
-   AI App (vLLM, lmcache, …)  ──adapter──►  libphoenix  ──ioctl/mmap──►  phxfs (kernel)
-        │                                                                       │ nvidia_p2p / PCIe P2P
-        └──────────────────────── DMA: storage ───────────────► GPU / xPU memory
+      AI App (vLLM, lmcache, …)
+                  │ adapter
+                  ▼
+   storage ──► Phoenix ──► xPU (GPU / NPU)
+        no detour through host memory
 ```
 
 The kernel module (`phxfs`) remaps GPU PCIe BAR memory and serves P2P mappings; the user library (`libphoenix`) and Python bindings expose simple registration/I/O APIs; adapters plug Phoenix into AI frameworks.
 
 ## Features & supported matrix
-
-要加上支持什么模型。md支持什么样的展示方案？是否可以支持drawio？我想以一颗树的形式，从底层向上生长。 清晰的展示 支持底层的内核版本， IO技术， xPU 型号，应用场景，应用框架，模型。然后通过点击来扩展这个树。
 
 | Area | Status | Notes |
 | --- | --- | --- |

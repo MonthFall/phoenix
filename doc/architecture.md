@@ -6,18 +6,19 @@ Phoenix refactors the I/O stack for **GPU Direct Storage (GDS)** so that data mo
 
 ```
             AI Application (vLLM, lmcache, ...)
-                      │  adapter  (e.g. phxloader)
+                      │  adapter  (e.g. phxloader, via pybind11)
                       ▼
         ┌─────────────────────────────┐
         │  libphoenix  (user library) │   phxfs_open / regmem / read / write
-        │  python/phxfs (ctypes bind) │
+        │  DevConnector (per-vendor)  │   vendor device lookup + async launch
         └──────────────┬──────────────┘
                        │  ioctl / mmap  (char device /dev/phxfs_devN)
                        ▼
         ┌─────────────────────────────┐
         │   phxfs  (kernel module)    │   P2P map GPU BAR, DMA into GPU mem
+        │   P2P backend (per-vendor)  │
         └──────────────┬──────────────┘
-                       │  nvidia_p2p_get_pages / PCIe P2P
+                       │  vendor P2P API (e.g. nvidia_p2p_get_pages) / PCIe P2P
                        ▼
                  GPU / xPU memory  ◄──── DMA from NVMe / NFS storage
 ```
@@ -32,20 +33,30 @@ Phoenix refactors the I/O stack for **GPU Direct Storage (GDS)** so that data mo
 
 | Path | Responsibility |
 | --- | --- |
-| `module/` | `phxfs` Linux kernel module: GPU BAR remap, per-GPU char device, `mmap`/`ioctl` P2P mapping |
-| `libphoenix/` | User-space C/C++ library wrapping the char device; buffer registration and synchronous/async I/O |
-| `python/` | `phxfs` Python package (ctypes) exposing the library to Python |
-| `adapters/` | Integration with AI frameworks. `adapters/vllm/` ships `phxloader` for safetensors weight loading |
+| `module/` | `phxfs` Linux kernel module: GPU BAR remap, per-GPU char device, `mmap`/`ioctl` P2P mapping; `phxfs-backend.*` selects the vendor P2P backend at build time |
+| `libphoenix/` | User-space C/C++ library wrapping the char device; buffer registration and synchronous/async I/O; `connectors/` holds the vendor-specific `DevConnector` |
+| `adapters/` | Integration with AI frameworks via pybind11. `adapters/vLLM/` ships `phxloader` for safetensors weight loading |
 | `example/` | Minimal end-to-end usage example |
-| `benchmarks/` | Performance evaluation binaries (breakdown, end-to-end, kvcache, micro, safetensor) |
-| `tests/` | Correctness tests (`.cu`) |
+| `test/` | Correctness + performance tests (`test_regmem`, `test_io`) |
 | `scripts/` | Helper/evaluation scripts |
 | `third-party/fio/` | fio for I/O testing |
 
+## Multi-vendor support
+
+Both the kernel module and `libphoenix` use a single compile-time switch, `PHXFS_VENDOR` (default `NVIDIA`), to select the accelerator vendor:
+
+```shell
+cmake -DPHXFS_VENDOR=NVIDIA ../   # default
+cmake -DPHXFS_VENDOR=AMD ../      # requires module/amd-backend.c + libphoenix/connectors/amd_connector.cpp
+cmake -DPHXFS_VENDOR=HUAWEI ../   # requires module/huawei-backend.c + libphoenix/connectors/huawei_connector.cpp
+```
+
+Core code (kernel: `phxfs.c`/`phxfs-mem.c`; user library: `phoenix.cpp`/`integration.cpp`) never references vendor APIs directly — it calls through `phxfs_p2p` (kernel) / `devconn` (user library) function-pointer tables. Adding a new vendor only requires implementing one backend file per layer; see `doc/kernel-module.md` and `doc/libphoenix.md`.
+
 ## Supported environment (tested)
 
-- **OS**: Ubuntu 22.04
+- **OS**: Ubuntu 22.04 / TencentOS
 - **Kernel**: Linux 6.1 (see [install.md](install.md) for details)
-- **Accelerator**: NVIDIA GPU with CUDA 12.4 and the open `nvidia-fs` driver
+- **Accelerator**: NVIDIA GPU with CUDA 12.4+ and the open `nvidia-fs` driver
 - **Storage**: NVMe-of / NFS (local NVMe also supported for the direct path)
-- **NPU**: experimentally proven feasible; not yet supported by the current code (see [roadmap.md](roadmap.md))
+- **Other vendors (AMD, Huawei NPU)**: backend interface is ready; vendor-specific implementations not yet shipped (see [roadmap.md](roadmap.md))
