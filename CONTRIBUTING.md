@@ -20,7 +20,7 @@ Follow [doc/install.md](doc/install.md) to build the kernel module, library, and
 ## Pull requests
 
 - Keep changes focused; describe the motivation and the testing you performed.
-- For kernel-module changes, include `dmesg` output showing a successful `insmod` and any new test results from `tests/`.
+- For kernel-module changes, include `dmesg` output showing a successful `insmod` and any new test results from `test/`.
 - Run the relevant benchmark/example to confirm no regression before opening a PR.
 
 ## Code style
