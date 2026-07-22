@@ -2,6 +2,7 @@
 #define __PHXFS_COMMOM_H__
 #include <linux/types.h>
 #include <asm/ioctl.h>
+#include <stdbool.h>   /* `bool` */
 
 
 #define u64 __u64
@@ -9,8 +10,6 @@
 #define u8 __u8
 #define u32 __u32 
 #define loff_t __u64
-
-#define DEV_MEM_SIZE 1024 * 1024 * 1024 * 2
 
 struct phxfs_mem_find_info{
     u64 devaddr;

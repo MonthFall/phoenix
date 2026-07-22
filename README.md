@@ -1,28 +1,26 @@
 # Phoenix
 
-**Direct I/O middleware from storage systems to xPU accelerators (GPU / NPU).**
+**An open-source, refactored GPU Direct Storage (GDS) I/O stack — without phony buffers.**
 
-Phoenix refactors the I/O stack for GPU Direct Storage so that data moves from storage straight into accelerator memory via DMA — **bypassing CPU host-memory bounce buffers** ("phony buffers"). AI applications integrate through adapters, getting I/O acceleration with minimal changes.
+Phoenix is a rebuilt version of GPU Direct Storage (GDS) that lets data flow straight from storage into GPU/NPU memory — faster, and easier to deploy than existing GDS. AI applications plug in through simple adapters.
 
-> 📄 Built on the SC'25 paper *"Phoenix: A Refactored I/O Stack for GPU Direct Storage without Phony Buffers"*.
-
+> 📄 Built on the SC'25 paper *"Phoenix: A Refactored I/O Stack for GPU Direct Storage without Phony Buffers"*. Phoenix is now a long-term open-source middleware for storage→xPU I/O, with adapters for AI data (vLLM done; lmcache planned).
 ## 📰 News
 
-- **2025** — Phoenix paper accepted at [SC'25](https://doi.org/10.1145/3712285.3759862).
-- **phxloader V2.2 released** — official adapter for **vLLM**: safetensors weight loading via DMA straight into GPU memory (`--load-format phxsafetensors`).
-- **Repository repositioned** — Phoenix is now a long-term open-source middleware for storage→xPU I/O, with adapters for AI data loading (vLLM done; lmcache planned).
+
+- **2026.7。21 batch I/O API** — `phxfs_read_batch`/`phxfs_write_batch` and async `phxfs_batch_submit_*`/`phxfs_batch_wait`, backed by an `io_uring` engine and a NUMA-aware thread pool; removes per-request syscall overhead for KV-cache / weight-loading workloads.
+- **2026.7.10 phxloader released** — adapter for **vLLM**: safetensors weight loading via DMA straight into GPU memory (`--load-format phxsafetensors`).
+- **2025.12** — Phoenix paper accepted at [SC'25](https://doi.org/10.1145/3712285.3759862).
 
 ## What is Phoenix
 
-Phoenix is a thin middleware layer between storage and accelerators:
+By removing the phony buffer, Phoenix becomes a direct hub between storage and xPU — accelerators (GPU/NPU) and AI apps plug in, and data streams straight through:
 
-```
-   AI App (vLLM, lmcache, …)  ──adapter──►  libphoenix  ──ioctl/mmap──►  phxfs (kernel)
-        │                                                                       │ nvidia_p2p / PCIe P2P
-        └──────────────────────── DMA: storage ───────────────► GPU / xPU memory
-```
+<p align="center">
+  <img src="doc/phoenix-architecture.png" alt="Phoenix architecture: AI applications plug into the Phoenix hub, connecting storage to xPU accelerators" width="900">
+</p>
 
-The kernel module (`phxfs`) remaps GPU PCIe BAR memory and serves P2P mappings; the user library (`libphoenix`) and Python bindings expose simple registration/I/O APIs; adapters plug Phoenix into AI frameworks.
+The kernel module (`phxfs`) maps accelerator memory via `ZONE_DEVICE` and serves P2P mappings; the user library (`libphoenix`) exposes simple registration/I/O APIs; adapters (via pybind11) plug Phoenix into AI frameworks.
 
 ## Features & supported matrix
 
@@ -31,10 +29,11 @@ The kernel module (`phxfs`) remaps GPU PCIe BAR memory and serves P2P mappings; 
 | Core I/O (storage→GPU DMA, no phony buffer) | ✅ Implemented | `phxfs` + `libphoenix` |
 | Python bindings | ✅ Implemented | `python/phxfs` (ctypes) |
 | vLLM model loading | ✅ Implemented | `adapters/vllm/phxloader` (V2.2) |
+| Batch & async I/O (`io_uring`) | ✅ Implemented | sync `phxfs_*_batch` + async submit/wait; NUMA thread pool; `libaio` engine planned |
 | lmcache KV-cache acceleration | 🚧 Roadmap | see [roadmap](doc/roadmap.md) |
 | NPU (non-NVIDIA) support | 🔬 Research | experimentally proven, not yet in code |
-| Async I/O (`io_uring`) | 🚧 Roadmap | currently `pread`/`pwrite` + CUDA host func |
 
+ 
 **Environment (tested)**
 
 - OS: Ubuntu 22.04 · Kernel: Linux 6.1 · NVIDIA driver 550.54 (open + `nvidia-fs`) · CUDA 12.4 · MLNX_OFED 24.10
@@ -43,28 +42,9 @@ The kernel module (`phxfs`) remaps GPU PCIe BAR memory and serves P2P mappings; 
 
 ## Roadmap
 
-Engineering (production hardening) and research (new capabilities) tracks are detailed in [doc/roadmap.md](doc/roadmap.md) — including async `io_uring` I/O, >32 GiB registration, broader kernel/DKMS packaging, NPU support, and a future MCP-based shared bug knowledge base.
+Engineering (production hardening) and research (new capabilities) tracks are detailed in [doc/roadmap.md](doc/roadmap.md) — including a `libaio` batch engine, >32 GiB registration, broader kernel/DKMS packaging, NPU support, and a future MCP-based shared bug knowledge base.
 
-## Quick install & demo
 
-```shell
-# 1. prerequisites: NVIDIA GDS + MLNX_OFED (see doc/install.md)
-# 2. build
-mkdir -p build && cd build && cmake ../ && make -j
-# 3. install kernel module (run nvidia-smi first)
-sudo make insmod
-# 4. quick demo
-sudo ./bin/example <file_path> <io_size> <mode>
-```
-
-For vLLM weight loading:
-
-```shell
-cd adapters/vllm/phxloader && bash install.sh
-# then launch vLLM with: --load-format phxsafetensors
-```
-
-Full instructions: [doc/install.md](doc/install.md).
 
 ## Documentation
 
@@ -86,7 +66,7 @@ Full instructions: [doc/install.md](doc/install.md).
 
 ## Contact & community
 
-*Contact information to be added (maintainers / mailing list / Slack or WeChat group).* For bug reports, please use the issue template and the `scripts/collect_bug_info.sh` collector — see [CONTRIBUTING.md](CONTRIBUTING.md).
+*Contact information to be added (maintainers / mailing list / Slack or WeChat group).* For bug reports, please use the issue template — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Cite
 

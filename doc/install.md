@@ -27,16 +27,7 @@ sudo reboot
 
 ## 3. Storage backend
 
-### NVMe-of
-```shell
-cd scripts
-sudo bash nvme_of.sh <target|initiator> <setup|cleanup>
-```
-### NFS
-```shell
-cd scripts
-sudo bash nfs.sh <server|client>
-```
+Set up the storage backend for your environment (NVMe-oF target/initiator, or NFS over RDMA) so the test/data files live on it. Phoenix itself is storage-agnostic: it issues `O_DIRECT` I/O on whatever fd the application opens, so any filesystem/block backend that supports direct I/O works.
 
 ## 4. Build Phoenix
 
@@ -45,9 +36,11 @@ mkdir -p build && cd build
 cmake ../
 make -j
 ```
-This compiles the user library, the `phxfs` kernel module, and the benchmarks.
+This compiles the user library, the `phxfs` kernel module, and the tests.
 
 To skip the kernel module: `cmake -Dno_module=true ../`.
+
+To target a different accelerator vendor: `cmake -DPHXFS_VENDOR=AMD ../` (default is `NVIDIA`).
 
 ## 5. Install the kernel module
 
@@ -56,12 +49,15 @@ cd build && sudo make insmod
 ```
 Run `nvidia-smi` first to `modprobe` the NVIDIA driver. If installation fails, see [troubleshooting.md](troubleshooting.md).
 
-## 6. Quick demo
+## 6. Run tests
 
-A minimal end-to-end example lives in `example/example.cc`. Build it via the top-level CMake (target `example`) and run:
+The test binaries double as end-to-end examples of the library API:
 
 ```shell
-cd build && sudo ./bin/example <file_path> <io_size> <mode>
+cd build
+./bin/test_regmem 0   # memory registration lifecycle
+./bin/test_io 0        # I/O correctness + performance
+./bin/test_batch       # batch I/O correctness + bandwidth
 ```
 
 For vLLM weight loading, install the adapter and set `--load-format phxsafetensors` (see [adapters.md](adapters.md)).

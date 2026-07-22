@@ -15,7 +15,6 @@
 namespace {
 
 constexpr size_t PAGE_SIZE = 4096;
-constexpr size_t GPU_PAGE_SIZE = 64 * 1024;  // HUGE_PAGE_SIZE in phoenix
 
 inline size_t align_up(size_t val, size_t alignment) {
     return (val + alignment - 1) & ~(alignment - 1);
@@ -23,13 +22,13 @@ inline size_t align_up(size_t val, size_t alignment) {
 
 }  // namespace
 
-PhxLoader::PhxLoader(int cuda_device_id)
-    : cuda_device_(cuda_device_id), initialized_(false) {
-    dev_ = phxfs_find_dev_for_cuda_gpu(cuda_device_id);
+PhxLoader::PhxLoader(int device_id)
+    : device_id_(device_id), initialized_(false) {
+    dev_ = phxfs_find_dev(device_id);
     if (dev_ < 0) {
         throw std::runtime_error(
-            "PhxLoader: phxfs_find_dev_for_cuda_gpu(" +
-            std::to_string(cuda_device_id) + ") failed with " +
+            "PhxLoader: phxfs_find_dev(" +
+            std::to_string(device_id) + ") failed with " +
             std::to_string(dev_));
     }
 
@@ -53,8 +52,9 @@ PhxLoader::~PhxLoader() {
 }
 
 uintptr_t PhxLoader::regmem(void *gpu_ptr, size_t size) {
-    // Align size up to GPU_PAGE_SIZE (64K), required by phxfs_regmem
-    size_t aligned_size = align_up(size, GPU_PAGE_SIZE);
+    // Align size up to device page size, required by phxfs_regmem
+    size_t page_size = phxfs_get_page_size();
+    size_t aligned_size = align_up(size, page_size);
 
     void *target_addr = nullptr;
     int ret = phxfs_regmem(dev_, gpu_ptr, aligned_size, &target_addr);

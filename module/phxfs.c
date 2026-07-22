@@ -29,8 +29,7 @@
 #include "phxfs-mem.h"
 #include "phxfs.h"
 
-#include "nvfs-p2p.h"
-#include "nvfs-pci.h"
+#include "phxfs-backend.h"
 
 static DEFINE_IDA(phxfs_chr_minor_ida);
 static dev_t phxfs_chr_devt;
@@ -44,7 +43,7 @@ struct phxfs_ctrl ctrl;
 
 #define NUM_THREADS 128
 u32 npu_num;
-extern uint64_t gpu_info_table[MAX_GPU_DEVS];
+uint64_t gpu_info_table[MAX_GPU_DEVS];
 
 int phxfs_numa_node = -1;
 module_param(phxfs_numa_node, int, 0644);
@@ -638,6 +637,7 @@ void phxfs_cdev_del(struct cdev *cdev, struct device *cdev_device,
 			kfree(dev->segments);
 			dev->segments = NULL;
 			dev->num_segments = 0;
+			dev->p2p_pgmap = NULL; /* already freed per-segment above */
 		} else if (dev->p2p_pgmap) {
 			/* Legacy single-segment cleanup */
 			devm_memunmap_pages(&dev->dev->dev, &dev->p2p_pgmap->pgmap);
@@ -722,26 +722,65 @@ destroy_subsys_class:
 	return ret;
 }
 
-static int __init phxfs_init(void) {
-	int ret, i;
+static void phxfs_discover_devices(void)
+{
+	struct pci_dev *pdev = NULL;
 
-	if (nvfs_nvidia_p2p_init()) {
-		phxfs_warn("Could not load nvidia_p2p* symbols\n");
-		ret = -EOPNOTSUPP;
+	memset(gpu_info_table, 0, sizeof(gpu_info_table));
+	npu_num = 0;
+
+	/* Scan 3D display controllers */
+	while ((pdev = pci_get_class(PCI_CLASS_DISPLAY_3D << 8, pdev)) != NULL) {
+		if (pdev->vendor != PHXFS_PCI_VENDOR_ID || !pdev->bus)
+			continue;
+		if (phxfs_numa_node >= 0 &&
+		    pcibus_to_node(pdev->bus) != phxfs_numa_node) {
+			phxfs_info("phxfs: skip GPU %04x:%02x:%02x.%d (numa mismatch)\n",
+				   pci_domain_nr(pdev->bus), pdev->bus->number,
+				   PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn));
+			continue;
+		}
+		if (npu_num >= MAX_GPU_DEVS)
+			break;
+		gpu_info_table[npu_num] =
+			((uint64_t)pci_domain_nr(pdev->bus) << 32) |
+			PCI_DEVID(pdev->bus->number, pdev->devfn);
+		phxfs_info("phxfs: found GPU %04x:%02x:%02x.%d (index=%u)\n",
+			   pci_domain_nr(pdev->bus), pdev->bus->number,
+			   PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn), npu_num);
+		npu_num++;
+	}
+
+	/* Scan VGA display controllers */
+	while ((pdev = pci_get_class(PCI_CLASS_DISPLAY_VGA << 8, pdev)) != NULL) {
+		if (pdev->vendor != PHXFS_PCI_VENDOR_ID || !pdev->bus)
+			continue;
+		if (phxfs_numa_node >= 0 &&
+		    pcibus_to_node(pdev->bus) != phxfs_numa_node)
+			continue;
+		if (npu_num >= MAX_GPU_DEVS)
+			break;
+		gpu_info_table[npu_num] =
+			((uint64_t)pci_domain_nr(pdev->bus) << 32) |
+			PCI_DEVID(pdev->bus->number, pdev->devfn);
+		phxfs_info("phxfs: found GPU %04x:%02x:%02x.%d (index=%u)\n",
+			   pci_domain_nr(pdev->bus), pdev->bus->number,
+			   PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn), npu_num);
+		npu_num++;
+	}
+}
+
+static int __init phxfs_init(void) {
+	int ret;
+
+	if (phxfs_p2p_backend_init()) {
+		phxfs_warn("Could not initialize P2P backend\n");
 		return -1;
 	}
 
-	nvfs_fill_gpu2peer_distance_table_once();
-	npu_num = 0;
-	for (i = 0; i < MAX_DEV_NUM; i++) {
-		if (gpu_info_table[i] != 0) {
-			npu_num++;
-		} else {
-			break;
-		}
-	}
+	phxfs_discover_devices();
 
-	phxfs_info("devdrv_get_devnum num:%d\n", npu_num);
+	phxfs_info("found %u GPU device(s)\n", npu_num);
 
 	if (npu_num <= 0 || npu_num > MAX_DEV_NUM) {
 		phxfs_err("devdrv_get_devnum error:%u\n", npu_num);
@@ -767,7 +806,7 @@ static void __exit phxfs_exit(void) {
 		phxfs_cdev_del(&ctrl.phx_dev[i].cdev, &ctrl.phx_dev[i].device, &ctrl.phx_dev[i]);
 	}
 
-	nvfs_nvidia_p2p_exit();
+	phxfs_p2p_backend_exit();
 
 	class_destroy(phxfs_chr_class);
 	unregister_chrdev_region(phxfs_chr_devt, PHXFS_MINORS);
@@ -781,5 +820,5 @@ module_exit(phxfs_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("qiushi <qiushijsxs@outlook.com>");
-MODULE_DESCRIPTION("NPU/NVIDIA direct storgae");
+MODULE_DESCRIPTION("Phoenix direct storage for multi-vendor accelerators");
 MODULE_VERSION("0.0.1");
