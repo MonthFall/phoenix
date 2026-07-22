@@ -9,7 +9,6 @@
  * preference; the first one that probes successfully wins:
  *
  *   io_uring  -> best on kernels that support it (default)
- *   libaio    -> (future) alternative async framework
  *   sync      -> pread/pwrite loop, always-available fallback
  *
  * Each request's target buffer has already been resolved to a host
@@ -19,6 +18,15 @@
 
 #include <sys/types.h>
 #include <cstddef>
+
+/*
+ * Per-syscall I/O chunk size, shared by every engine and the single-request
+ * API. The kernel module supports one arbitrarily large mmap+ioctl
+ * registration, so this only chunks the *I/O*: a single read()/write()/
+ * io_uring op transfers at most MAX_RW_COUNT (INT_MAX & PAGE_MASK, ~2GiB) per
+ * call. 1GiB is a clean, 64KiB-aligned value well under that cap.
+ */
+#define PHXFS_IO_CHUNK (1024ULL * 1024 * 1024)  /* 1 GiB */
 
 enum phxfs_io_op {
     PHXFS_IO_READ = 0,
@@ -61,39 +69,43 @@ extern const struct phxfs_io_engine phxfs_io_engine_uring;
 #endif
 
 /* ------------------------------------------------------------------ *
- * NUMA-aware batch thread pool
+ * Batch I/O thread pool
  *
- * A batch of already-resolved requests is fanned out (round-robin) across
- * the worker threads pinned to a given NUMA node, each running the active
- * engine's submit_batch on its own thread_local ring. This lets a single
- * top-level call saturate the device without the caller managing threads
- * (important for the Python/pybind path, which must cross the GIL once).
+ * A batch of already-resolved requests is fanned out (round-robin) across a
+ * small, fixed set of worker threads, each running the active engine's
+ * submit_batch on its own thread_local ring. Multiple independent rings can
+ * submit/reap concurrently, which is what lets one top-level call reach an
+ * array's aggregate bandwidth (a single ring saturates at most one device);
+ * it also lets a single call cross the Python GIL once instead of the caller
+ * managing threads.
  *
- * Requests are routed to the pool of the NUMA node that owns the target
- * GPU, avoiding cross-NUMA DMA.
+ * There is deliberately no NUMA-based routing here: the actual P2P transfer
+ * is device-to-device DMA (NVMe controller -> PCIe -> GPU BAR) that never
+ * touches host RAM, so which CPU/node issues io_uring_submit() has no bearing
+ * on that data path. Pinning workers to "the GPU's NUMA node" would, if
+ * anything, be pinning to the wrong device's node whenever the GPU and the
+ * NVMe backing the fd are not on the same node.
  * ------------------------------------------------------------------ */
 
-#define PHXFS_MAX_NUMA_NODES   8
-#define PHXFS_THREADS_PER_NODE 4
+#define PHXFS_POOL_THREADS 4   /* worker/ring count; tune to the storage array's parallelism */
 
 /*
- * Run a whole batch synchronously via the pool for `numa_node`.
- * Fills each req->result. Returns the number of failed requests (>=0),
- * or negative on a pool-level error. Falls back to inline execution on
- * the calling thread if the pool is unavailable.
+ * Run a whole batch synchronously via the pool. Fills each req->result.
+ * Returns the number of failed requests (>=0), or negative on a pool-level
+ * error. Falls back to inline execution on the calling thread if the pool is
+ * unavailable.
  */
-int phxfs_pool_run(struct phxfs_io_op_req *reqs, int n, enum phxfs_io_op op,
-                   int numa_node);
+int phxfs_pool_run(struct phxfs_io_op_req *reqs, int n, enum phxfs_io_op op);
 
 /*
- * Async pool primitives (compute–I/O overlap). submit returns immediately;
- * the batch owns the node's pool until wait() completes it. `reqs` must
- * stay alive until wait() returns.
+ * Async pool primitives (compute-I/O overlap). submit enqueues on a bounded
+ * FIFO and returns immediately; `reqs` must stay alive until wait() returns.
+ * blocking=true waits for a free queue slot; blocking=false fails with
+ * -EBUSY (via NULL + errno) when the queue is full instead of waiting.
  */
 struct phxfs_pool_async;  /* opaque */
 struct phxfs_pool_async *phxfs_pool_submit(struct phxfs_io_op_req *reqs, int n,
-                                           enum phxfs_io_op op, int numa_node,
-                                           bool blocking);
+                                           enum phxfs_io_op op, bool blocking);
 int phxfs_pool_wait(struct phxfs_pool_async *h);
 
 #endif /* __PHXFS_IO_ENGINE_H__ */

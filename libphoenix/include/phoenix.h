@@ -1,7 +1,7 @@
 #ifndef __PHOENIX_H__
 #define __PHOENIX_H__
 /* Public C API: use C headers only so this compiles under a plain C compiler
- * as well as C++ (P1-8). */
+ * as well as C++. */
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -48,7 +48,7 @@ static inline int phxfs_find_dev_for_cuda_gpu(int cuda_gpu_id) {
 /*
  * Register/deregister a device (GPU) buffer for direct I/O.
  *
- * IMPORTANT (P2-5): read/write and the batch API identify a buffer by its
+ * IMPORTANT: read/write and the batch API identify a buffer by its
  * original DEVICE address (`addr` here, `buf` there) — NOT by `*target_addr`.
  * `*target_addr` is an internal host-mapped handle returned for reference; do
  * not pass it back as the I/O buffer or the lookup will miss. `addr` must be
@@ -59,17 +59,29 @@ static inline int phxfs_find_dev_for_cuda_gpu(int cuda_gpu_id) {
 int phxfs_regmem(int device_id, const void *addr, size_t len, void **target_addr);
 int phxfs_deregmem(int device, const void *addr, size_t len);
 
+/*
+ * fid.deviceID selects the target buffer the same way as the batch API below:
+ *   - fid.deviceID >= 0: `buf` must lie inside a GPU registration on that
+ *     phxfs device (phxfs_regmem), or the call fails.
+ *   - fid.deviceID  < 0: `buf` is a plain CPU (host) address.
+ */
 ssize_t phxfs_read(phxfs_fileid_t fid, void *buf, off_t buf_offset, ssize_t nbyte, off_t f_offset);
 ssize_t phxfs_write(phxfs_fileid_t fid, void *buf, off_t buf_offset, ssize_t nbyte, off_t f_offset);
 
 /* ------------------------------------------------------------------ *
  * Batch I/O
  *
- * A single call submits N independent I/O requests to the underlying
- * async engine (io_uring today; libaio / sync-fallback selected at
- * runtime). This removes the per-request syscall overhead of looping
- * over phxfs_read/phxfs_write, and lets the storage layer service the
- * requests concurrently.
+ * A single call submits N independent I/O requests to the underlying I/O
+ * engine (io_uring where available, sync pread/pwrite fallback otherwise),
+ * fanned out over a small pool of worker threads/rings. This removes the
+ * per-request syscall overhead of looping over phxfs_read/phxfs_write, and
+ * lets the storage layer service the requests concurrently.
+ *
+ * NOTE on fork(): the internal worker pool is fork-safe via pthread_atfork
+ * (the child lazily re-creates the pool on first use), but the kernel P2P
+ * mappings and device fds created by phxfs_open/phxfs_regmem in the parent
+ * are NOT inherited correctly across fork. Callers that need multi-process
+ * should use spawn (re-open in the child), not fork-after-open.
  *
  * The target buffer is selected by the SIGN of device_id:
  *   - device_id >= 0: a GPU buffer previously registered with phxfs_regmem
@@ -78,10 +90,8 @@ ssize_t phxfs_write(phxfs_fileid_t fid, void *buf, off_t buf_offset, ssize_t nby
  *   - device_id  < 0: an ordinary CPU buffer (e.g. pinned host memory used
  *     by a store path); `buf` is used as a plain host address.
  *
- * A batch may mix requests targeting different devices. Requests are grouped
- * by the NUMA node of their target GPU and each group runs on that node's
- * pool, so a mixed-device batch does not force every request onto the first
- * device's node (this applies to both the synchronous and asynchronous batch).
+ * A batch may freely mix requests targeting different devices and CPU
+ * buffers; all requests share the same worker pool.
  * ------------------------------------------------------------------ */
 typedef struct phxfs_io_req {
     int      fd;          /* open file descriptor (O_DIRECT recommended) */
@@ -115,26 +125,28 @@ int phxfs_read_batch(phxfs_io_req_t *reqs, int n);
 int phxfs_write_batch(phxfs_io_req_t *reqs, int n);
 
 /*
- * Asynchronous batch — submit returns immediately after queuing the batch
- * on the internal NUMA pool; the caller can run GPU compute meanwhile, then
- * call phxfs_batch_wait() to block for completion and get per-request
- * results. Enables compute/I/O overlap.
+ * Asynchronous batch — submit queues the batch on the worker pool and
+ * returns immediately; the caller can run GPU compute meanwhile, then call
+ * phxfs_batch_wait() to block for completion and get per-request results.
+ * Enables compute/I/O overlap.
+ *
+ * Submitted batches queue up (bounded capacity) and each runs with the
+ * pool's full worker set in turn — so pipelining several submits (e.g. to
+ * prefetch ahead) is supported without waiting for the previous one first.
+ * If the queue is full, submit fails immediately (non-blocking) with NULL
+ * and errno == EBUSY rather than waiting for space.
  *
  *   reqs (and every resource it references — see the lifetime contract on
  *   phxfs_read_batch above: fd, CPU buffer, GPU registration) MUST remain
  *   valid until phxfs_batch_wait()/phxfs_batch_destroy() returns, and its
  *   fields MUST NOT be modified after submit.
- *   The batch is partitioned by target NUMA node and one sub-batch is queued
- *   per node. At most one async batch may be in flight per NUMA node; submit
- *   is NON-BLOCKING. If EVERY target node is busy, submit returns NULL with
- *   errno == EBUSY and runs nothing. If only SOME target nodes are busy,
- *   submit still queues the free nodes and returns a handle; the busy nodes'
- *   requests are reported as -EBUSY by phxfs_batch_wait, so the caller can
- *   retry exactly those without redoing already-committed I/O.
+ *   Each handle must be consumed by exactly one call to phxfs_batch_wait()
+ *   or phxfs_batch_destroy(); after that call the handle is freed and must
+ *   not be used again.
  *
  * phxfs_batch_submit_read/write return an opaque handle, or NULL on error
- * (errno == EBUSY if a target node is busy, ENOMEM on allocation failure,
- * ENOTSUP if the worker pool is unavailable).
+ * (errno == EBUSY if the pool's queue is full, ENOMEM on allocation
+ * failure, ENOTSUP if the worker pool is unavailable).
  * phxfs_batch_wait returns the number of failed requests (>=0), or negative
  * on error, copies per-request results back, and frees the handle.
  * phxfs_batch_destroy abandons a batch: it waits for in-flight I/O to quiesce

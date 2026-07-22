@@ -10,7 +10,7 @@ Phoenix refactors the I/O stack for **GPU Direct Storage (GDS)** so that data mo
                       ▼
         ┌─────────────────────────────┐
         │  libphoenix  (user library) │   phxfs_open / regmem / read / write
-        │  DevConnector (per-vendor)  │   vendor device lookup + async launch
+        │  DevConnector (per-vendor)  │   vendor device lookup + page size
         └──────────────┬──────────────┘
                        │  ioctl / mmap  (char device /dev/phxfs_devN)
                        ▼
@@ -48,7 +48,7 @@ cmake -DPHXFS_VENDOR=AMD ../      # requires module/amd-backend.c + libphoenix/c
 cmake -DPHXFS_VENDOR=HUAWEI ../   # requires module/huawei-backend.c + libphoenix/connectors/huawei_connector.cpp
 ```
 
-Core code (kernel: `phxfs.c`/`phxfs-mem.c`; user library: `phoenix.cpp`) never references vendor APIs directly — it calls through `phxfs_p2p` (kernel) / `devconn` (user library) function-pointer tables. Adding a new vendor only requires implementing one backend file per layer; see `doc/kernel-module.md` and `doc/libphoenix.md`.
+Core code (kernel: `phxfs.c`/`phxfs-mem.c`; user library: `phx_device.cpp`/`phx_mem.cpp`/`phx_io.cpp`) never references vendor APIs directly — it calls through `phxfs_p2p` (kernel) / `devconn` (user library) function-pointer tables. Adding a new vendor only requires implementing one backend file per layer; see `doc/kernel-module.md` and `doc/libphoenix.md`.
 
 ## Supported environment (tested)
 

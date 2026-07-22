@@ -27,16 +27,7 @@ sudo reboot
 
 ## 3. Storage backend
 
-### NVMe-of
-```shell
-cd scripts
-sudo bash nvme_of.sh <target|initiator> <setup|cleanup>
-```
-### NFS
-```shell
-cd scripts
-sudo bash nfs.sh <server|client>
-```
+Set up the storage backend for your environment (NVMe-oF target/initiator, or NFS over RDMA) so the test/data files live on it. Phoenix itself is storage-agnostic: it issues `O_DIRECT` I/O on whatever fd the application opens, so any filesystem/block backend that supports direct I/O works.
 
 ## 4. Build Phoenix
 
@@ -45,7 +36,7 @@ mkdir -p build && cd build
 cmake ../
 make -j
 ```
-This compiles the user library, the `phxfs` kernel module, the example, and the tests.
+This compiles the user library, the `phxfs` kernel module, and the tests.
 
 To skip the kernel module: `cmake -Dno_module=true ../`.
 

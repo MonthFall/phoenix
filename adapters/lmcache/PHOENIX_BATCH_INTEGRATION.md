@@ -5,10 +5,10 @@
 > [LMCache#1 (`phx_l2_adapter`)](https://github.com/xPU-IO/LMCache/pull/1).
 >
 > This document describes **how to adapt the LMCache side** to the new
-> Phoenix batch API. The Phoenix core changes (the batch API + NUMA thread
-> pool) are already merged in `libphoenix`; **no further Phoenix core change
-> is required for the basics below.** The changes here are to `phxcache`
-> (pybind layer) and the two LMCache files.
+> Phoenix batch API. The Phoenix core changes (the batch API + internal
+> worker pool) are already merged in `libphoenix`; **no further Phoenix core
+> change is required for the basics below.** The changes here are to
+> `phxcache` (pybind layer) and the two LMCache files.
 
 ---
 
@@ -48,8 +48,8 @@ Key performance fact from Phoenix-side benchmarking (4-disk RAID0):
 
 A **single** `phxfs_read_batch(reqs, N)` call, with N large (thousands of
 chunks), already saturates the array — Phoenix internally fans the batch across
-a NUMA-pinned thread pool of io_uring rings. **The adapter stays single
-threaded** and crosses the GIL once.
+a shared pool of worker threads, each with its own io_uring ring. **The adapter
+stays single threaded** and crosses the GIL once.
 
 ---
 
@@ -88,13 +88,16 @@ Notes that matter for the adapter:
 - **Different fds per request are fine.** You can point each request at a
   different file, or many requests at the *same* fd with different `f_offset`
   (this is what packed files below exploit).
-- **GPU vs CPU buffer is auto-detected.** If `(device_id, buf)` matches a
-  `phxfs_regmem` registration, the request DMAs into GPU memory; otherwise
-  `buf` is treated as a plain CPU address. So **store (CPU) and retrieve (GPU)
-  use the same batch call** — see §5.
-- **NUMA routing is automatic.** Phoenix routes the batch to the thread pool
-  pinned to the target GPU's NUMA node (derived from the device's PCI BDF), so
-  DMA stays on the local node.
+- **GPU vs CPU buffer is selected by the sign of `device_id`.**
+  `device_id >= 0` requires `buf` to lie inside a `phxfs_regmem` registration
+  on that phxfs device — otherwise the request fails with `-EFAULT` (there is
+  no silent CPU fallback). `device_id < 0` (e.g. `-1`) means `buf` is a plain
+  CPU address. So **store (CPU) and retrieve (GPU) use the same batch call** —
+  see §5.
+- **No NUMA routing — deliberately.** The transfer is device-to-device DMA
+  (NVMe controller → PCIe → GPU BAR) that never touches host RAM, so which CPU
+  issues the I/O has no bearing on the data path. One shared pool of worker
+  threads (4 by default), each with its own io_uring ring, drives every batch.
 - **No `open` in the batch.** Files must already be open (fds passed in). This
   is where the fd-cache / packed-file work (§3) pays off.
 
@@ -346,9 +349,9 @@ The single background `_worker_loop` thread stays as-is; only the *body* of
 
 Today `_process_store` writes each tensor with buffered `open(..., "wb")` +
 `numpy()` (CPU memory). You can optionally route store through the same batch
-API, since Phoenix auto-detects CPU buffers:
+API, since a negative `device_id` marks the request as a plain CPU buffer:
 
-- Build `phxfs_io_req_t` with `device_id = -1` (or any non-registered id) and
+- Build `phxfs_io_req_t` with `device_id = -1` (any negative value) and
   `buf = tensor.data_ptr()` (CPU pinned memory), then call
   `phxcache.PhxBatch.write(reqs)`. Phoenix treats it as a plain host buffer and
   issues the writes through the same pool.
@@ -378,13 +381,23 @@ I/Os per step" — a perfect fit for batch. Recommended file layout:
   results = b.wait()                              # ensure layer L KV is resident
   ```
 
-  Because Phoenix holds the target GPU's NUMA pool between `submit` and `wait`,
-  keep it to **one in-flight async batch per GPU** (submit → wait → submit next).
-  That is exactly the layer-pipeline pattern.
+  Submitted batches queue on a bounded FIFO (16 slots) and each runs with the
+  pool's full worker set in turn, so you can **prefetch several layers ahead**:
+  submit L+1, L+2, … without waiting for the previous one, then `wait()` the
+  handles in order. If the queue is full, submit fails with `errno == EBUSY` —
+  wait the oldest handle first and retry.
 
 - Index granularity: store `(layer, block) -> (pack_file, offset, len)`. On the
   store side, append a layer's blocks contiguously so the read offsets within a
   layer are sequential (best for readahead / large effective I/O).
+
+> **Multi-process (vLLM MP) note.** Each process gets its own pool/rings and
+> device fds — no cross-process coordination is needed. The pool registers a
+> `pthread_atfork` child handler, so a forked child lazily re-creates the pool
+> on first use and may use the batch API normally. One caveat: an async batch
+> handle submitted *before* fork() does not survive into the child — always
+> `phxfs_batch_wait()`/`phxfs_batch_destroy()` outstanding handles before
+> forking.
 
 ---
 
@@ -423,7 +436,7 @@ exactly as `_load_dma` already does).
 Because retrieve runs under the Python GIL: N Python worker threads calling
 `f.read()` would serialise on the GIL and add complexity to the L2 interface.
 Pushing the fan-out **below** the C boundary (one `PhxBatch.read` that releases
-the GIL and internally uses a NUMA-pinned pool of io_uring rings) gives full
+the GIL and internally uses a shared pool of io_uring rings) gives full
 disk bandwidth with a **single** adapter thread and a **single** GIL crossing.
 This was verified on a 4-disk RAID0: one batch call ≈ 25 GB/s vs ≈ 2.6 GB/s for
 the per-chunk loop.

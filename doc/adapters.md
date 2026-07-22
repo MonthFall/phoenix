@@ -4,7 +4,7 @@ Adapters connect Phoenix to AI applications. Each adapter depends on `libphoenix
 
 ## vLLM — `phxloader` (available)
 
-`adapters/vllm/phxloader` provides GPU Direct Storage loading of `safetensors` model weights via Phoenix's DMA engine. It parses the safetensors header, plans reads into read-groups, registers a shared GPU buffer, and DMAs weights straight into GPU memory — bypassing CPU host memory.
+`adapters/vLLM/phxloader` provides GPU Direct Storage loading of `safetensors` model weights via Phoenix's DMA engine. It parses the safetensors header, plans reads into read-groups, registers a shared GPU buffer, and DMAs weights straight into GPU memory — bypassing CPU host memory.
 
 **Current release: V2.2**
 
@@ -19,7 +19,7 @@ Adapters connect Phoenix to AI applications. Each adapter depends on `libphoenix
 
 ```bash
 # Prerequisites: conda env active, libphoenix built (build/libphoenix.so)
-cd adapters/vllm/phxloader
+cd adapters/vLLM/phxloader
 bash install.sh
 ```
 
@@ -53,6 +53,6 @@ loader.close()
 
 `libphoenix`, `liburing`, CUDA, `pybind11`, PyTorch.
 
-## lmcache (roadmap)
+## lmcache (integration guide available)
 
-Integration with [lmcache](https://github.com/LMCache/LMCache) for KV-cache offload/loading acceleration is planned. See [roadmap.md](roadmap.md).
+KV-cache offload/loading acceleration via the Phoenix batch API. The integration guide for the `phxcache` pybind layer and the LMCache `phx_l2_adapter` lives at [`adapters/lmcache/PHOENIX_BATCH_INTEGRATION.md`](../adapters/lmcache/PHOENIX_BATCH_INTEGRATION.md): one `phxfs_read_batch` per retrieve task (sync or pipelined async for layerwise overlap), packed files so many chunks share one fd, and no Python worker threads — concurrency lives inside Phoenix below the GIL.

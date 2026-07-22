@@ -12,8 +12,6 @@
 
 #include "io_engine.h"
 
-#define PHXFS_IO_CHUNK (1024ULL * 1024 * 1024)  /* 1 GiB */
-
 static int sync_probe(void) {
     return 0;  /* always available */
 }
@@ -30,7 +28,7 @@ static ssize_t do_one(struct phxfs_io_op_req *r, enum phxfs_io_op op) {
             : pwrite(r->fd, base + done, chunk, r->f_offset + (off_t)done);
         if (ret < 0) {
             if (errno == EINTR)
-                continue;                        /* P1-7: retry */
+                continue;                        /* interrupted: retry the same chunk */
             /* Return partial progress if any, else the negative errno, to
              * match phxfs_read/write's unified semantics. */
             return done > 0 ? (ssize_t)done : -errno;

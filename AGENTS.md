@@ -11,7 +11,7 @@ Phoenix is middleware for **direct I/O from storage to xPU (GPU/NPU)** via DMA, 
 | Path | Role |
 | --- | --- |
 | `module/` | `phxfs` kernel module — GPU BAR remap, per-GPU char device, `mmap`/`ioctl` P2P mapping; `phxfs-backend.*` + `nvidia-backend.c` select the P2P backend |
-| `libphoenix/` | User C/C++ lib — `phxfs_open/close`, `regmem/deregmem`, `read/write`, batch + async batch (`phoenix.cpp`), pluggable I/O engines (`io_engine_*`, `io_pool.cpp`); `connectors/` holds the vendor `DevConnector` (`nvidia_connector.cpp`) |
+| `libphoenix/` | User C/C++ lib — `phxfs_open/close`, `regmem/deregmem`, `read/write`, batch + async batch (`phx_device.cpp` / `phx_mem.cpp` / `phx_io.cpp`), pluggable I/O engines under `io_engine/` (`io_engine_*.cpp`, `io_pool.cpp`); `connectors/` holds the vendor `DevConnector` (`nvidia_connector.cpp`) |
 | `adapters/vLLM/phxloader/` | vLLM weight loader (safetensors → GPU DMA) via pybind11, published `phxloader` pkg |
 | `adapters/lmcache/` | (roadmap) KV-cache acceleration |
 | `test/` | Correctness + performance tests (`test_regmem`, `test_io`, `test_batch`) |
@@ -34,7 +34,7 @@ Target a different vendor: `cmake -DPHXFS_VENDOR=AMD ../` (requires implementing
 
 **Kernel module work** — edit under `module/`; rebuild with `make` in `build/`; `sudo make insmod`. Watch `dmesg` for `phxfs*` messages. If `insmod` fails with "Operation not permitted", the GPU BAR is held by another process/driver (see `doc/troubleshooting.md`). Vendor-specific P2P calls live only in `<vendor>-backend.c`; core files (`phxfs.c`, `phxfs-mem.c`, `phxfs-p2p-service.c`) call through the `phxfs_p2p` function-pointer table and must stay vendor-agnostic.
 
-**Library / API work** — edit `libphoenix/`; `libphoenix.so` is consumed by adapters via pybind11. Vendor-specific calls (CUDA, HIP, ...) live only in `libphoenix/connectors/<vendor>_connector.cpp`; core files (`phoenix.cpp`) call through the `devconn` function-pointer table and must stay vendor-agnostic.
+**Library / API work** — edit `libphoenix/`; `libphoenix.so` is consumed by adapters via pybind11. Vendor-specific calls (CUDA, HIP, ...) live only in `libphoenix/connectors/<vendor>_connector.cpp`; core files (`phx_device.cpp`, `phx_mem.cpp`, `phx_io.cpp`) call through the `devconn` function-pointer table and must stay vendor-agnostic.
 
 **App integration** — vLLM: `adapters/vLLM/phxloader` exposes `PhxLoader` and a `phxsafetensors` load_format. New adapters register a GPU buffer via `libphoenix` and DMA through `phxfs_read`/`phxfs_write`.
 

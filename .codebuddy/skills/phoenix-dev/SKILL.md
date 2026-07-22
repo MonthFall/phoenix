@@ -40,14 +40,16 @@ do not read the whole tree.
 ## Workflow 2 — Work on the user library
 
 - `libphoenix/` is the C/C++ API (`phxfs_open/close`, `regmem/deregmem`, `read/write`, and
-  the batch API `phxfs_*_batch` + async `phxfs_batch_submit_*`/`phxfs_batch_wait`).
+  the batch API `phxfs_*_batch` + async `phxfs_batch_submit_*`/`phxfs_batch_wait`), split
+  into `phx_device.cpp` (device lifecycle), `phx_mem.cpp` (registration/mapping), `phx_io.cpp`
+  (read/write/batch/async).
 - Vendor-specific calls (CUDA, HIP, ...) live only in `libphoenix/connectors/<vendor>_connector.cpp`.
-  Core file `phoenix.cpp` calls through the `devconn` function-pointer table and must stay
+  Core files (`phx_device.cpp`, `phx_mem.cpp`, `phx_io.cpp`) call through the `devconn` function-pointer table and must stay
   vendor-agnostic — never add `#include <cuda.h>` etc. there.
-- Batch/async I/O runs on a pluggable engine (`io_engine_*`) behind a NUMA thread pool
-  (`io_pool.cpp`), chosen at load: `io_uring` → `sync` fallback. The old stream-based
-  `phxfs_read_async/write_async` were removed (application-side stream integration lives
-  in the adapter).
+- Batch/async I/O runs on a pluggable engine (`io_engine/io_engine_*.cpp`) behind a worker
+  pool (`io_engine/io_pool.cpp`), chosen at load: `io_uring` → `sync` fallback. The old
+  stream-based `phxfs_read_async/write_async` were removed (application-side stream
+  integration lives in the adapter).
 
 ## Workflow 3 — Upper-layer application integration
 

@@ -10,6 +10,7 @@
 // Run:   ./test_batch [ngpu]        (default: all visible GPUs, capped 8)
 //        File: TEST_FILE + ".batch.<gpu>" per GPU (default dir /mnt/nvme0)
 
+
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -144,8 +145,9 @@ static void cpu_correctness(const char *base_file) {
       }
       CHECK(ok, "CPU async small n=1..3 + cross-thread wait"); }
 
-    // pipeline (P2-2): several concurrent same-node submits all succeed (bounded
-    // FIFO queue, no spurious EBUSY) and each completes with correct data.
+    // pipeline: several concurrent submits to the shared pool all succeed
+    // (bounded FIFO queue, no spurious EBUSY) and each completes with correct
+    // data — i.e. a caller can queue ahead instead of one submit at a time.
     { const int P = 3;
       uint8_t *pbuf[P] = {nullptr};
       phxfs_batch_t *ph[P] = {nullptr};
@@ -170,7 +172,7 @@ static void cpu_correctness(const char *base_file) {
           }
           free(pbuf[q]);
       }
-      CHECK(ok, "pipeline: %d concurrent same-node submits succeed + verify", P); }
+      CHECK(ok, "pipeline: %d concurrent pool submits succeed + verify", P); }
 
     // invalid device id and negative offset -> per-request -EFAULT, no crash
     { std::vector<phxfs_io_req_t> r; mk(r, 4);
@@ -180,7 +182,7 @@ static void cpu_correctness(const char *base_file) {
       CHECK(rc == 2, "invalid-device + negative-offset -> 2 failures (rc=%d)", rc);
       CHECK(r[1].result == -EFAULT && r[2].result == -EFAULT, "bad reqs marked -EFAULT"); }
 
-    // CPU write batch: write buf -> a fresh file, read back and verify (T6)
+    // CPU write batch: write buf -> a fresh file, read back and verify
     { std::string wp = std::string(base_file) + ".cpuw";
       int wfd = open(wp.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
       if (wfd >= 0) {
@@ -246,11 +248,12 @@ static void correctness(const char *base_file) {
     }
     ret = phxfs_read_batch(reqs.data(), REQS);
     cudaMemcpy(hbuf, gbuf, buf_bytes, cudaMemcpyDeviceToHost); cudaStreamSynchronize(0);
-    size_t scat_bad = 0;
+    size_t bad_chunks = 0;
     for (int i = 0; i < REQS; i++)
-        scat_bad += verify_region(hbuf, (size_t)i * CHUNK, CHUNK,
-                                  (uint64_t)(REQS - 1 - i) * CHUNK) ? 1 : 0;
-    CHECK(ret == 0 && scat_bad == 0, "scattered-offset batch correct (%zu bad chunks)", scat_bad);
+        if (verify_region(hbuf, (size_t)i * CHUNK, CHUNK,
+                          (uint64_t)(REQS - 1 - i) * CHUNK) != 0)
+            bad_chunks++;
+    CHECK(ret == 0 && bad_chunks == 0, "scattered-offset batch correct (%zu bad chunks)", bad_chunks);
 
     // small batches n = 0..5 (regression for the worker-participation bug).
     // Each n repeated a few times to shake out generation/pending races.
@@ -337,8 +340,8 @@ static void gpu_worker(int gpu, const char *base_file, worker_result *out) {
 
     const int    NREQ = REQS * BATCHES;
     const size_t file_bytes = (size_t)NREQ * CHUNK;
-    // T2: one distinct GPU target region per in-flight request (no overlap),
-    // so the result can be verified and mis-routing/duplication is detectable.
+    // One distinct GPU target region per in-flight request (no overlap), so
+    // the result can be verified and mis-routing/duplication is detectable.
     const size_t buf_bytes = file_bytes;
 
     std::string fp = std::string(base_file) + ".batch." + std::to_string(gpu);
@@ -356,7 +359,7 @@ static void gpu_worker(int gpu, const char *base_file, worker_result *out) {
 
     // One large batch: request i reads file chunk i into GPU chunk i — every
     // target region is distinct. A single blocking call should saturate the
-    // array while exercising the internal NUMA pool.
+    // array while exercising the internal worker pool.
     std::vector<phxfs_io_req_t> reqs(NREQ);
     for (int i = 0; i < NREQ; i++) {
         reqs[i] = phxfs_io_req_t{};
@@ -387,63 +390,10 @@ static void gpu_worker(int gpu, const char *base_file, worker_result *out) {
     close(dfd); phxfs_deregmem(dev, gbuf, buf_bytes); phxfs_close(dev); cudaFree(gbuf);
 }
 
-// Single-GPU, multi-thread worker: N threads each with its own ring read
-// distinct file regions into distinct sub-ranges of one shared buffer.
-// Isolates "multiple rings scale bandwidth" from NUMA/GPU-placement.
-static void mt_worker(int gpu, void *gbuf, size_t sub_off, const char *fp,
-                      int tid, worker_result *out) {
-    out->ok = false; out->bytes = 0; out->secs = 0;
-    cudaSetDevice(gpu);
-    int dev = phxfs_find_dev(gpu);
-    const size_t buf_bytes = (size_t)REQS * CHUNK;
-
-    int dfd = open(fp, O_RDONLY | O_DIRECT);
-    if (dfd < 0) { printf("t%d: open %s: %s\n", tid, fp, strerror(errno)); return; }
-
-    std::vector<phxfs_io_req_t> reqs(REQS);
-    for (int i = 0; i < REQS; i++) {
-        reqs[i] = phxfs_io_req_t{};
-        reqs[i].fd = dfd; reqs[i].device_id = dev; reqs[i].buf = gbuf;
-        reqs[i].nbytes = CHUNK;
-    }
-    posix_fadvise(dfd, 0, (off_t)BATCHES * buf_bytes, POSIX_FADV_DONTNEED);
-    bool ok = true;
-    double t0 = now_sec();
-    for (int b = 0; b < BATCHES; b++) {
-        off_t base = (off_t)b * buf_bytes;
-        for (int i = 0; i < REQS; i++) {
-            reqs[i].buf_offset = (off_t)sub_off + (off_t)i * CHUNK;
-            reqs[i].f_offset   = base + (off_t)i * CHUNK;
-        }
-        if (phxfs_read_batch(reqs.data(), REQS) != 0) {
-            printf("t%d batch %d failed\n", tid, b);
-            ok = false;      // T1: do NOT report success after a failure
-            break;
-        }
-        out->bytes += buf_bytes;
-    }
-    out->secs = now_sec() - t0;
-    out->ok = ok;
-    // T2: verify the last batch actually landed in this thread's sub-range with
-    // the right file data — a return-code-only check can't detect mis-routing,
-    // duplication or a late/dropped write. (Not timed.)
-    if (ok) {
-        uint8_t *hbuf = (uint8_t *)malloc(buf_bytes);
-        cudaMemcpy(hbuf, (uint8_t *)gbuf + sub_off, buf_bytes, cudaMemcpyDeviceToHost);
-        cudaStreamSynchronize(0);
-        uint64_t f_base = (uint64_t)(BATCHES - 1) * buf_bytes;   // last batch's file base
-        size_t bad = verify_region(hbuf, 0, buf_bytes, f_base);
-        if (bad) { printf("t%d: DATA MISMATCH %zu words\n", tid, bad); out->ok = false; }
-        free(hbuf);
-    }
-    close(dfd);
-}
-
 int main(int argc, char **argv) {
     int ndev = 0;
     cudaGetDeviceCount(&ndev);
     int ngpu = (argc > 1) ? atoi(argv[1]) : ndev;
-    int mt   = (argc > 2) ? atoi(argv[2]) : 0;   // >0: single-GPU, mt threads
     if (ngpu > ndev) ngpu = ndev;
     if (ngpu > 8) ngpu = 8;
     if (ngpu < 1) ngpu = 1;
@@ -461,58 +411,23 @@ int main(int argc, char **argv) {
     size_t total_bytes = 0;
     bool all_ok = true;
 
-    if (mt > 0) {
-        // Single GPU (0), mt threads, mt independent rings, mt distinct files.
-        if (mt > 16) mt = 16;
-        printf("\n--- Part B: single-GPU multi-ring (GPU 0, %d threads/rings) ---\n", mt);
-        if (!prepare_files(mt, base_file)) { printf("file prep failed\n"); return 1; }
+    printf("\n--- Part B: concurrent bandwidth (%d GPU worker(s), independent rings) ---\n", ngpu);
+    if (!prepare_files(ngpu, base_file)) { printf("file prep failed\n"); return 1; }
 
-        cudaSetDevice(0);
-        int dev = phxfs_find_dev(0);
-        if (dev < 0 || phxfs_open(dev) != 0) { printf("phxfs open failed\n"); return 1; }
-        // One buffer with mt sub-ranges so rings don't overlap.
-        const size_t sub = (size_t)REQS * CHUNK;
-        void *gbuf = nullptr, *target = nullptr;
-        cudaMalloc(&gbuf, sub * mt); cudaMemset(gbuf, 0, sub * mt); cudaStreamSynchronize(0);
-        if (phxfs_regmem(dev, gbuf, sub * mt, &target) != 0) { printf("regmem failed\n"); return 1; }
+    std::vector<std::thread> ts;
+    std::vector<worker_result> res(ngpu);
+    t0 = now_sec();
+    for (int g = 0; g < ngpu; g++)
+        ts.emplace_back(gpu_worker, g, base_file, &res[g]);
+    for (auto &t : ts) t.join();
+    wall = now_sec() - t0;
 
-        std::vector<std::thread> ts;
-        std::vector<worker_result> res(mt);
-        t0 = now_sec();
-        for (int t = 0; t < mt; t++) {
-            std::string fp = std::string(base_file) + ".batch." + std::to_string(t);
-            ts.emplace_back(mt_worker, 0, gbuf, sub * t, strdup(fp.c_str()), t, &res[t]);
-        }
-        for (auto &t : ts) t.join();
-        wall = now_sec() - t0;
-
-        for (int t = 0; t < mt; t++) {
-            if (!res[t].ok) { all_ok = false; printf("  t%d: FAILED\n", t); continue; }
-            double gib = (double)res[t].bytes / GiB;
-            printf("  t%d: %6.2f GiB in %7.3f ms -> %6.2f GiB/s\n",
-                   t, gib, res[t].secs * 1e3, gib / res[t].secs);
-            total_bytes += res[t].bytes;
-        }
-        phxfs_deregmem(dev, gbuf, sub * mt); phxfs_close(dev); cudaFree(gbuf);
-    } else {
-        printf("\n--- Part B: concurrent bandwidth (%d GPU worker(s), independent rings) ---\n", ngpu);
-        if (!prepare_files(ngpu, base_file)) { printf("file prep failed\n"); return 1; }
-
-        std::vector<std::thread> ts;
-        std::vector<worker_result> res(ngpu);
-        t0 = now_sec();
-        for (int g = 0; g < ngpu; g++)
-            ts.emplace_back(gpu_worker, g, base_file, &res[g]);
-        for (auto &t : ts) t.join();
-        wall = now_sec() - t0;
-
-        for (int g = 0; g < ngpu; g++) {
-            if (!res[g].ok) { all_ok = false; printf("  gpu%d: FAILED\n", g); continue; }
-            double gib = (double)res[g].bytes / GiB;
-            printf("  gpu%d: %6.2f GiB in %7.3f ms -> %6.2f GiB/s\n",
-                   g, gib, res[g].secs * 1e3, gib / res[g].secs);
-            total_bytes += res[g].bytes;
-        }
+    for (int g = 0; g < ngpu; g++) {
+        if (!res[g].ok) { all_ok = false; printf("  gpu%d: FAILED\n", g); continue; }
+        double gib = (double)res[g].bytes / GiB;
+        printf("  gpu%d: %6.2f GiB in %7.3f ms -> %6.2f GiB/s\n",
+               g, gib, res[g].secs * 1e3, gib / res[g].secs);
+        total_bytes += res[g].bytes;
     }
 
     double tgib = (double)total_bytes / GiB;

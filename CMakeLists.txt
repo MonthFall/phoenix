@@ -185,13 +185,13 @@ add_custom_target(
 
 # Library source files
 set(libphoenix_root "${PROJECT_SOURCE_DIR}/libphoenix")
-file(GLOB libphoenix_source "${libphoenix_root}/*.cpp")
+file(GLOB libphoenix_source "${libphoenix_root}/*.cpp" "${libphoenix_root}/io_engine/*.cpp")
 file(GLOB libphoenix_include "${libphoenix_root}/include/*.h")
 
 # io_engine_uring.cpp requires liburing; drop it when unavailable so the
 # sync fallback engine is still built.
 if (NOT LIBURING_FOUND)
-    list(REMOVE_ITEM libphoenix_source "${libphoenix_root}/io_engine_uring.cpp")
+    list(REMOVE_ITEM libphoenix_source "${libphoenix_root}/io_engine/io_engine_uring.cpp")
 endif ()
 
 # Select vendor-specific connector source file
@@ -206,21 +206,6 @@ endif ()
 add_library(libphoenix ${libphoenix_source} ${devconn_source} ${libphoenix_include})
 set_target_properties (libphoenix PROPERTIES OUTPUT_NAME "phoenix")
 target_include_directories(libphoenix PRIVATE "${libphoenix_root}")
-
-# Export only the public C API; hide internal symbols (P2-6). The linker
-# version script (local: *) demotes everything not listed to local, so we do
-# NOT also use -fvisibility=hidden (that would mark symbols STV_HIDDEN at
-# compile time, which the script's `global:` list cannot re-export).
-target_link_options(libphoenix PRIVATE
-    "-Wl,--version-script=${libphoenix_root}/libphoenix.map")
-
-# Prevent the compiler from emitting STB_GNU_UNIQUE symbols (e.g. std::string
-# template instantiations such as _M_mutate). The version script's `local: *`
-# cannot demote GNU-unique symbols, so without this they would still leak into
-# the dynamic export table (P2-4). GCC-only flag.
-if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    target_compile_options(libphoenix PRIVATE -fno-gnu-unique)
-endif ()
 
 # The library itself depends on cudart (nvidia_connector) and pthreads (io
 # pool); declare them as link deps so libphoenix.so carries the right

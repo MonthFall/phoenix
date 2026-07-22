@@ -1,25 +1,30 @@
 /*
- * NUMA-aware batch I/O thread pool.
+ * Batch I/O thread pool.
  *
- * One pool per NUMA node, PHXFS_THREADS_PER_NODE worker threads each, pinned to
- * that node's CPUs. Work is submitted as independent "jobs"; each job is run by
- * ALL of the node's workers cooperatively (round-robin stripe across its own
- * thread_local io_uring ring), so a single job still saturates the array's
- * bandwidth.
+ * A fixed set of PHXFS_POOL_THREADS worker threads, each running the active
+ * engine's submit_batch on its own thread_local ring. A batch is split
+ * round-robin across the workers so N rings issue I/O concurrently and reach
+ * the storage array's aggregate bandwidth ceiling, while the caller makes one
+ * (blocking or async) call and crosses the Python GIL once.
  *
- * Concurrency model (P2-2 — bounded FIFO queue per node):
- *   - Each node has a bounded FIFO queue of jobs. submit() enqueues a job and
- *     returns immediately (non-blocking); it only fails with EBUSY when the
- *     queue is full. This supports pipelining: a caller can submit several
- *     batches, overlap compute, then wait each handle — no more "one slot held
- *     until wait()" stalling the next submit.
- *   - Jobs run ONE AT A TIME (the worker group serves the queue head, then
- *     advances to the next), so every job keeps the full worker/bandwidth width
- *     — we deliberately do NOT split the workers across concurrent jobs.
- *   - Each job carries its own result state (failed/err/done); results are read
- *     by that job's wait(), decoupled from when the scheduling slot is freed.
- *   - A worker participates in the current job iff its lane < that job's stride;
- *     only participating workers touch the request array and decrement pending.
+ * Workers are NOT pinned to any NUMA node: the P2P transfer this pool exists
+ * to drive is device-to-device DMA that never touches host RAM, so the CPU a
+ * worker runs on has no effect on that data path (see io_engine.h). The only
+ * job of this pool is fanning a batch out across enough independent rings.
+ *
+ * Scheduling model (bounded FIFO queue):
+ *   - Submitted jobs queue up (bounded capacity) and run one at a time, each
+ *     using the full worker set — so every job still gets the pool's full
+ *     concurrency. submit() enqueues and returns immediately; it only fails
+ *     with EBUSY when the queue itself is full. This supports pipelining:
+ *     a caller can submit several batches, overlap compute, then wait each
+ *     handle, without a single global "one batch in flight" stall.
+ *   - Each job carries its own result state (failed/err/done); results are
+ *     read by that job's wait(), decoupled from when the job leaves the
+ *     queue.
+ *   - A worker participates in the current job iff its lane < that job's
+ *     stride; only participating workers touch the request array and
+ *     decrement pending.
  */
 #include <cerrno>
 #include <cstdio>
@@ -27,14 +32,12 @@
 #include <cstring>
 
 #include <pthread.h>
-#include <sched.h>
-#include <unistd.h>
 
 #include "io_engine.h"
 
-/* Bounded in-flight jobs per node (queued + running). Enough to pipeline a few
- * batches for compute/I/O overlap without letting a runaway producer queue
- * unbounded work. */
+/* Bounded in-flight jobs (queued + running). Enough to pipeline a few batches
+ * for compute/I/O overlap without letting a runaway producer queue unbounded
+ * work. */
 #define PHXFS_POOL_QUEUE_CAP 16
 
 /* One unit of work. Independent, heap- or stack-allocated by the submitter; its
@@ -51,12 +54,11 @@ struct pool_job {
 
 struct worker {
     pthread_t tid;
-    int       node;
-    int       lane;            /* 0..THREADS_PER_NODE-1 */
+    int       lane;            /* 0..PHXFS_POOL_THREADS-1 */
 };
 
-struct node_pool {
-    struct worker   workers[PHXFS_THREADS_PER_NODE];
+struct pool_state {
+    struct worker   workers[PHXFS_POOL_THREADS];
     int             nthreads;
 
     pthread_mutex_t mtx;
@@ -73,10 +75,9 @@ struct node_pool {
     bool             stop;
 };
 
-static struct node_pool g_pools[PHXFS_MAX_NUMA_NODES];
-static int              g_num_nodes = 0;
-static bool             g_pool_ready = false;
-static pthread_once_t   g_once = PTHREAD_ONCE_INIT;
+static struct pool_state g_pool;
+static bool              g_pool_ready = false;
+static pthread_once_t    g_once = PTHREAD_ONCE_INIT;
 
 /* Run this worker's stripe of `job`: reqs[lane], reqs[lane+stride], ...
  * Accumulates this lane's failure count / first engine error into out params. */
@@ -125,7 +126,7 @@ static void worker_run_stripe(struct pool_job *job, int lane, int stride,
 /* Promote the queue head to `cur` and wake its workers. Caller holds mtx.
  * If the queue is empty, cur becomes NULL; under stop that also wakes idle
  * workers so they can exit. */
-static void start_next_locked(struct node_pool *p) {
+static void start_next_locked(struct pool_state *p) {
     struct pool_job *job = p->q_head;
     if (!job) {
         p->cur = NULL;
@@ -153,24 +154,7 @@ static void start_next_locked(struct node_pool *p) {
 
 static void *worker_main(void *arg) {
     struct worker *w = (struct worker *)arg;
-    struct node_pool *p = &g_pools[w->node];
-
-    /* Pin to this NUMA node's CPUs. Scan ALL possible CPU IDs, not just
-     * 0..nproc-1: CPU IDs can be sparse or have low-numbered CPUs offline, so
-     * _SC_NPROCESSORS_ONLN is not a valid upper bound and would miss a node's
-     * high-numbered CPUs (P2-7). node%d/cpuC exists iff CPU C is on this node. */
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    bool any = false;
-    for (int c = 0; c < CPU_SETSIZE; c++) {
-        char path[128];
-        snprintf(path, sizeof(path),
-                 "/sys/devices/system/node/node%d/cpu%d", w->node, c);
-        if (access(path, F_OK) == 0) { CPU_SET(c, &set); any = true; }
-    }
-    if (any && pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0)
-        fprintf(stderr, "phxfs pool: setaffinity(node %d) failed: %s\n",
-                w->node, strerror(errno));
+    struct pool_state *p = &g_pool;
 
     long seen = 0;
     pthread_mutex_lock(&p->mtx);
@@ -179,9 +163,9 @@ static void *worker_main(void *arg) {
                !(p->cur_gen != seen && p->cur != NULL && w->lane < p->stride))
             pthread_cond_wait(&p->work_cv, &p->mtx);
 
-        /* Exit only once the queue is fully drained (P1-7): while a job is
-         * current we run it even under stop, so `pending` is always decremented
-         * and no waiter is left hanging. */
+        /* Exit only once the queue is fully drained: while a job is current we
+         * run it even under stop, so `pending` is always decremented and no
+         * waiter is left hanging. */
         if (p->stop && p->cur == NULL) {
             pthread_mutex_unlock(&p->mtx);
             return NULL;
@@ -209,53 +193,61 @@ static void *worker_main(void *arg) {
     }
 }
 
-static void pool_init(void) {
-    for (int nd = 0; nd < PHXFS_MAX_NUMA_NODES; nd++) {
-        char path[96];
-        snprintf(path, sizeof(path), "/sys/devices/system/node/node%d", nd);
-        if (access(path, F_OK) != 0)
-            break;
-        g_num_nodes = nd + 1;
-    }
-    if (g_num_nodes < 1)
-        g_num_nodes = 1;
+/*
+ * Called in the child after fork(): the parent's worker threads did not
+ * survive, so the pool's mutex/condvars and g_once are stale. Reset everything
+ * to "never initialised" so the child lazily re-creates the pool on first use.
+ */
+static void pool_atfork_child(void) {
+    g_pool_ready = false;
+    g_once = PTHREAD_ONCE_INIT;
+    g_pool.nthreads = 0;
+    g_pool.cur = NULL;
+    g_pool.q_head = g_pool.q_tail = NULL;
+    g_pool.inflight = 0;
+    g_pool.stop = false;
+}
 
-    for (int nd = 0; nd < g_num_nodes; nd++) {
-        struct node_pool *p = &g_pools[nd];
-        pthread_mutex_init(&p->mtx, NULL);
-        pthread_cond_init(&p->work_cv, NULL);
-        pthread_cond_init(&p->done_cv, NULL);
-        pthread_cond_init(&p->free_cv, NULL);
-        p->q_head = p->q_tail = NULL;
-        p->cur = NULL;
-        p->cur_gen = 0;
-        p->stride = 0;
-        p->pending = 0;
-        p->inflight = 0;
-        p->stop = false;
-        p->nthreads = PHXFS_THREADS_PER_NODE;
-        for (int t = 0; t < p->nthreads; t++) {
-            p->workers[t].node = nd;
-            p->workers[t].lane = t;
-            if (pthread_create(&p->workers[t].tid, NULL, worker_main,
-                               &p->workers[t]) != 0) {
-                p->nthreads = t;
-                break;
-            }
+static void pool_init(void) {
+    struct pool_state *p = &g_pool;
+    pthread_mutex_init(&p->mtx, NULL);
+    pthread_cond_init(&p->work_cv, NULL);
+    pthread_cond_init(&p->done_cv, NULL);
+    pthread_cond_init(&p->free_cv, NULL);
+    p->q_head = p->q_tail = NULL;
+    p->cur = NULL;
+    p->cur_gen = 0;
+    p->stride = 0;
+    p->pending = 0;
+    p->inflight = 0;
+    p->stop = false;
+    p->nthreads = PHXFS_POOL_THREADS;
+    for (int t = 0; t < p->nthreads; t++) {
+        p->workers[t].lane = t;
+        if (pthread_create(&p->workers[t].tid, NULL, worker_main,
+                           &p->workers[t]) != 0) {
+            p->nthreads = t;
+            break;
         }
     }
     g_pool_ready = true;
+
+    /*
+     * fork() only copies the calling thread; the worker threads vanish but
+     * g_pool_ready / g_once survive. Without a reset the child would enqueue
+     * a job, broadcast work_cv, and block forever (no workers to process it).
+     * pthread_atfork(child) resets the pool to its pre-init state so the
+     * child lazily re-creates it on first use.
+     */
+    pthread_atfork(NULL, NULL, pool_atfork_child);
 }
 
-/* Resolve node + validate pool. Returns NULL if inline fallback needed. */
-static struct node_pool *pool_for(int numa_node) {
+/* Validate the pool. Returns NULL if inline fallback needed. */
+static struct pool_state *pool_get(void) {
     pthread_once(&g_once, pool_init);
-    if (numa_node < 0 || numa_node >= g_num_nodes)
-        numa_node = 0;
-    struct node_pool *p = &g_pools[numa_node];
-    if (!g_pool_ready || p->nthreads <= 0)
+    if (!g_pool_ready || g_pool.nthreads <= 0)
         return NULL;
-    return p;
+    return &g_pool;
 }
 
 /*
@@ -263,7 +255,7 @@ static struct node_pool *pool_for(int numa_node) {
  * queue is full (async submit); blocking=true waits for a free slot (sync).
  * Returns 0 on success, -1 with errno set (EBUSY / ESHUTDOWN) otherwise.
  */
-static int job_enqueue(struct node_pool *p, struct pool_job *job, bool blocking) {
+static int job_enqueue(struct pool_state *p, struct pool_job *job, bool blocking) {
     pthread_mutex_lock(&p->mtx);
     if (p->stop) {
         pthread_mutex_unlock(&p->mtx);
@@ -297,7 +289,7 @@ static int job_enqueue(struct node_pool *p, struct pool_job *job, bool blocking)
 }
 
 /* Wait for `job` to complete; returns failure count or first engine error. */
-static int job_wait(struct node_pool *p, struct pool_job *job) {
+static int job_wait(struct pool_state *p, struct pool_job *job) {
     pthread_mutex_lock(&p->mtx);
     while (!job->done)
         pthread_cond_wait(&p->done_cv, &p->mtx);
@@ -306,12 +298,11 @@ static int job_wait(struct node_pool *p, struct pool_job *job) {
     return err < 0 ? err : failed;
 }
 
-int phxfs_pool_run(struct phxfs_io_op_req *reqs, int n, enum phxfs_io_op op,
-                   int numa_node) {
+int phxfs_pool_run(struct phxfs_io_op_req *reqs, int n, enum phxfs_io_op op) {
     if (n <= 0)
         return 0;
 
-    struct node_pool *p = pool_for(numa_node);
+    struct pool_state *p = pool_get();
     if (!p) {
         const struct phxfs_io_engine *eng = phxfs_io_engine_get();
         return eng->submit_batch(reqs, n, op);
@@ -332,18 +323,17 @@ int phxfs_pool_run(struct phxfs_io_op_req *reqs, int n, enum phxfs_io_op op,
 
 /* ------------------------------------------------------------------ *
  * Async: submit enqueues and returns immediately; wait blocks for that job.
- * Multiple jobs may be queued per node (bounded), enabling pipelining.
+ * Multiple jobs may be queued (bounded), enabling pipelining.
  * ------------------------------------------------------------------ */
 struct phxfs_pool_async {
-    struct node_pool *p;
-    struct pool_job   job;      /* embedded; enqueued by address */
+    struct pool_state *p;
+    struct pool_job     job;      /* embedded; enqueued by address */
     bool  inline_done;
     int   inline_failed;
 };
 
 struct phxfs_pool_async *phxfs_pool_submit(struct phxfs_io_op_req *reqs, int n,
-                                           enum phxfs_io_op op, int numa_node,
-                                           bool blocking) {
+                                           enum phxfs_io_op op, bool blocking) {
     struct phxfs_pool_async *h =
         (struct phxfs_pool_async *)calloc(1, sizeof(*h));
     if (!h)
@@ -355,11 +345,11 @@ struct phxfs_pool_async *phxfs_pool_submit(struct phxfs_io_op_req *reqs, int n,
         return h;
     }
 
-    struct node_pool *p = pool_for(numa_node);
+    struct pool_state *p = pool_get();
     if (!p) {
         /* Async needs the worker pool. Do NOT run the batch inline here: that
-         * would make "submit returns immediately" a lie (P1-1). Fail so the
-         * caller can fall back to the synchronous batch API instead. */
+         * would make "submit returns immediately" a lie. Fail so the caller
+         * can fall back to the synchronous batch API instead. */
         free(h);
         errno = ENOTSUP;
         return NULL;
@@ -371,8 +361,8 @@ struct phxfs_pool_async *phxfs_pool_submit(struct phxfs_io_op_req *reqs, int n,
     h->job.op = op;
     /* Enqueue on the bounded FIFO. blocking=false (async) returns EBUSY only
      * when the queue is FULL (not merely non-empty), so pipelining several
-     * batches now succeeds (P2-2). blocking=true is used by the sync mixed-NUMA
-     * path to reserve a slot. */
+     * batches succeeds. blocking=true is used by the sync path when it wants
+     * to reserve a slot. */
     if (job_enqueue(p, &h->job, blocking) != 0) {
         free(h);            /* errno set by job_enqueue (EBUSY / ESHUTDOWN) */
         return NULL;
@@ -394,27 +384,22 @@ int phxfs_pool_wait(struct phxfs_pool_async *h) {
 
 /*
  * Stop and join every worker at library unload. New submits are refused
- * (ESHUTDOWN); already-queued jobs are drained so their waiters never hang
- * (P1-7). Joining lets each worker return from worker_main(), running its
- * thread_local ring's destructor (io_uring_queue_exit), so no ring leaks and no
- * unloaded code runs later. Safe if the pool was never initialised.
+ * (ESHUTDOWN); already-queued jobs are drained so their waiters never hang.
+ * Joining lets each worker return from worker_main(), running its
+ * thread_local ring's destructor (io_uring_queue_exit), so no ring leaks and
+ * no unloaded code runs later. Safe if the pool was never initialised.
  */
 __attribute__((destructor))
 static void phxfs_pool_shutdown(void) {
     if (!g_pool_ready)
         return;
-    for (int nd = 0; nd < g_num_nodes; nd++) {
-        struct node_pool *p = &g_pools[nd];
-        pthread_mutex_lock(&p->mtx);
-        p->stop = true;
-        pthread_cond_broadcast(&p->work_cv);   /* wake idle workers to drain/exit */
-        pthread_cond_broadcast(&p->free_cv);   /* wake blocked submitters */
-        pthread_mutex_unlock(&p->mtx);
-    }
-    for (int nd = 0; nd < g_num_nodes; nd++) {
-        struct node_pool *p = &g_pools[nd];
-        for (int t = 0; t < p->nthreads; t++)
-            pthread_join(p->workers[t].tid, NULL);
-    }
+    struct pool_state *p = &g_pool;
+    pthread_mutex_lock(&p->mtx);
+    p->stop = true;
+    pthread_cond_broadcast(&p->work_cv);   /* wake idle workers to drain/exit */
+    pthread_cond_broadcast(&p->free_cv);   /* wake blocked submitters */
+    pthread_mutex_unlock(&p->mtx);
+    for (int t = 0; t < p->nthreads; t++)
+        pthread_join(p->workers[t].tid, NULL);
     g_pool_ready = false;
 }

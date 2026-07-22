@@ -19,7 +19,7 @@
 
 #define NV_MAX_GPUS 64        /* CUDA-GPU cache size */
 /* sysfs scan bound: must match the core's PHXFS_MAX_DEVICES (phoenix.cpp), as
- * find_device returns a phxfs index the core can actually open (P2-3). */
+ * find_device returns a phxfs index the core can actually open. */
 #define PHXFS_DEV_SCAN_MAX 8
 
 /* ------------------------------------------------------------------ */
@@ -28,7 +28,7 @@
 
 /* Cache CUDA-GPU -> phxfs-index so repeated find() calls don't re-query CUDA
  * and re-scan sysfs every time. -2 = unresolved; only successful (>=0) results
- * are cached, so a device that appears later can still be found (P2-3). */
+ * are cached, so a device that appears later can still be found. */
 static int             g_dev_cache[NV_MAX_GPUS];
 static bool            g_dev_cache_init = false;
 static pthread_mutex_t g_dev_cache_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -97,7 +97,7 @@ static int nvidia_find_device(int cuda_gpu_id)
         /* Cache success only. A negative result is deliberately NOT cached, so
          * a device that appears after the first query (module inserted / sysfs
          * node created later) is found on a later call without restarting the
-         * process (P2-3). */
+         * process. */
         pthread_mutex_lock(&g_dev_cache_lock);
         g_dev_cache[cuda_gpu_id] = idx;
         pthread_mutex_unlock(&g_dev_cache_lock);
