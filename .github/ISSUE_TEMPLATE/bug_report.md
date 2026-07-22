@@ -6,10 +6,12 @@ labels: bug
 assignees: ''
 ---
 
-## Environment (paste `scripts/collect_bug_info.sh` output)
+## Environment
+
+Paste your environment info: kernel version (`uname -r`), NVIDIA driver (`nvidia-smi`), loaded modules (`lsmod | grep phxfs`), and relevant `dmesg` output.
 
 ```text
-<paste collector output here>
+<paste environment info here>
 ```
 
 ## Description

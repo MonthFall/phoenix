@@ -8,6 +8,7 @@ Phoenix is a rebuilt version of GPU Direct Storage (GDS) that lets data flow str
 ## 📰 News
 
 
+- **2026.7。21 batch I/O API** — `phxfs_read_batch`/`phxfs_write_batch` and async `phxfs_batch_submit_*`/`phxfs_batch_wait`, backed by an `io_uring` engine and a NUMA-aware thread pool; removes per-request syscall overhead for KV-cache / weight-loading workloads.
 - **2026.7.10 phxloader released** — adapter for **vLLM**: safetensors weight loading via DMA straight into GPU memory (`--load-format phxsafetensors`).
 - **2025.12** — Phoenix paper accepted at [SC'25](https://doi.org/10.1145/3712285.3759862).
 
@@ -28,9 +29,9 @@ The kernel module (`phxfs`) maps accelerator memory via `ZONE_DEVICE` and serves
 | Core I/O (storage→GPU DMA, no phony buffer) | ✅ Implemented | `phxfs` + `libphoenix` |
 | Python bindings | ✅ Implemented | `python/phxfs` (ctypes) |
 | vLLM model loading | ✅ Implemented | `adapters/vllm/phxloader` (V2.2) |
+| Batch & async I/O (`io_uring`) | ✅ Implemented | sync `phxfs_*_batch` + async submit/wait; NUMA thread pool; `libaio` engine planned |
 | lmcache KV-cache acceleration | 🚧 Roadmap | see [roadmap](doc/roadmap.md) |
 | NPU (non-NVIDIA) support | 🔬 Research | experimentally proven, not yet in code |
-| Async I/O (`io_uring`) | 🚧 Roadmap | currently `pread`/`pwrite` + CUDA host func |
 
  
 **Environment (tested)**
@@ -41,48 +42,9 @@ The kernel module (`phxfs`) maps accelerator memory via `ZONE_DEVICE` and serves
 
 ## Roadmap
 
-Engineering (production hardening) and research (new capabilities) tracks are detailed in [doc/roadmap.md](doc/roadmap.md) — including async `io_uring` I/O, >32 GiB registration, broader kernel/DKMS packaging, NPU support, and a future MCP-based shared bug knowledge base.
+Engineering (production hardening) and research (new capabilities) tracks are detailed in [doc/roadmap.md](doc/roadmap.md) — including a `libaio` batch engine, >32 GiB registration, broader kernel/DKMS packaging, NPU support, and a future MCP-based shared bug knowledge base.
 
-## Quick install & demo
 
-### 1. Build kernel module + user library
-
-```shell
-# Default: NVIDIA GPU (no extra flags needed)
-mkdir -p build && cd build && cmake ../ && make -j
-
-# For other vendors (not yet implemented, interface ready):
-# cmake -DPHXFS_VENDOR=AMD ../
-# cmake -DPHXFS_VENDOR=HUAWEI ../
-```
-
-This produces:
-- `build/libphoenix.so` — user-space library
-- `build/module/phoenixfs.ko` — kernel module
-- `build/bin/test_regmem`, `build/bin/test_io` — test programs
-
-### 2. Insert kernel module
-
-```shell
-# Run nvidia-smi first to wake up the GPU BAR, then insert
-nvidia-smi
-sudo make insmod
-
-# Verify: 8 GPU devices should appear
-ls /dev/phxfs_dev*
-# Check dmesg for BAR remap messages
-dmesg | tail -20
-```
-
-### 3. Run tests
-
-```shell
-# Memory registration lifecycle (32 checks)
-./bin/test_regmem 0          # GPU 0
-
-# I/O correctness + performance (19 checks + throughput)
-./bin/test_io 0              # GPU 0
-```
 
 ## Documentation
 
@@ -104,7 +66,7 @@ dmesg | tail -20
 
 ## Contact & community
 
-*Contact information to be added (maintainers / mailing list / Slack or WeChat group).* For bug reports, please use the issue template and the `scripts/collect_bug_info.sh` collector — see [CONTRIBUTING.md](CONTRIBUTING.md).
+*Contact information to be added (maintainers / mailing list / Slack or WeChat group).* For bug reports, please use the issue template — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Cite
 

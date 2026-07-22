@@ -58,20 +58,15 @@ cd build && sudo make insmod
 ```
 Run `nvidia-smi` first to `modprobe` the NVIDIA driver. If installation fails, see [troubleshooting.md](troubleshooting.md).
 
-## 6. Quick demo
+## 6. Run tests
 
-A minimal end-to-end example lives in `example/example.cpp`. Build it via the top-level CMake (target `example`) and run:
-
-```shell
-cd build && sudo ./bin/example <file_path> <io_size> <mode>
-```
-
-## 7. Run tests
+The test binaries double as end-to-end examples of the library API:
 
 ```shell
 cd build
 ./bin/test_regmem 0   # memory registration lifecycle
 ./bin/test_io 0        # I/O correctness + performance
+./bin/test_batch       # batch I/O correctness + bandwidth
 ```
 
 For vLLM weight loading, install the adapter and set `--load-format phxsafetensors` (see [adapters.md](adapters.md)).

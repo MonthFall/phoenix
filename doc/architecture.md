@@ -36,10 +36,7 @@ Phoenix refactors the I/O stack for **GPU Direct Storage (GDS)** so that data mo
 | `module/` | `phxfs` Linux kernel module: GPU BAR remap, per-GPU char device, `mmap`/`ioctl` P2P mapping; `phxfs-backend.*` selects the vendor P2P backend at build time |
 | `libphoenix/` | User-space C/C++ library wrapping the char device; buffer registration and synchronous/async I/O; `connectors/` holds the vendor-specific `DevConnector` |
 | `adapters/` | Integration with AI frameworks via pybind11. `adapters/vLLM/` ships `phxloader` for safetensors weight loading |
-| `example/` | Minimal end-to-end usage example |
-| `test/` | Correctness + performance tests (`test_regmem`, `test_io`) |
-| `scripts/` | Helper/evaluation scripts |
-| `third-party/fio/` | fio for I/O testing |
+| `test/` | Correctness + performance tests (`test_regmem`, `test_io`, `test_batch`) |
 
 ## Multi-vendor support
 
@@ -51,7 +48,7 @@ cmake -DPHXFS_VENDOR=AMD ../      # requires module/amd-backend.c + libphoenix/c
 cmake -DPHXFS_VENDOR=HUAWEI ../   # requires module/huawei-backend.c + libphoenix/connectors/huawei_connector.cpp
 ```
 
-Core code (kernel: `phxfs.c`/`phxfs-mem.c`; user library: `phoenix.cpp`/`integration.cpp`) never references vendor APIs directly — it calls through `phxfs_p2p` (kernel) / `devconn` (user library) function-pointer tables. Adding a new vendor only requires implementing one backend file per layer; see `doc/kernel-module.md` and `doc/libphoenix.md`.
+Core code (kernel: `phxfs.c`/`phxfs-mem.c`; user library: `phoenix.cpp`) never references vendor APIs directly — it calls through `phxfs_p2p` (kernel) / `devconn` (user library) function-pointer tables. Adding a new vendor only requires implementing one backend file per layer; see `doc/kernel-module.md` and `doc/libphoenix.md`.
 
 ## Supported environment (tested)
 

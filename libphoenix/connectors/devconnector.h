@@ -19,7 +19,7 @@ extern "C" {
  * Adding a new vendor:
  *   1. Create <vendor>_connector.cc implementing devconn_ops
  *   2. Add the source file to CMakeLists.txt for that vendor
- *   3. No changes to phoenix.h / phoenix.cc / integration.cc
+ *   3. No changes to phoenix.h / phoenix.cpp
  */
 struct devconn_ops {
     const char  *name;                  /* "nvidia", "amd", "huawei", ... */
@@ -40,16 +40,6 @@ struct devconn_ops {
      * Returns phxfs device index (>=0) or -1 on failure.
      */
     int   (*find_device)(int device_id);
-
-    /*
-     * Launch an async callback on the vendor's stream.
-     *   stream:   vendor stream handle (CUstream / hipStream_t / ...)
-     *   callback: function to invoke when the stream reaches this point
-     *   data:     opaque user data passed to callback
-     * Returns 0 on success.
-     */
-    int   (*launch_async)(void *stream,
-                          void (*callback)(void *), void *data);
 };
 
 /*

@@ -2,6 +2,7 @@
 #define __PHXFS_COMMOM_H__
 #include <linux/types.h>
 #include <asm/ioctl.h>
+#include <stdbool.h>   /* `bool` for plain C compilers (P1-8) */
 
 
 #define u64 __u64

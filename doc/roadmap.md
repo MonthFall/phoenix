@@ -4,12 +4,12 @@ Phoenix is evolving from a research artifact (SC'25) into a long-term open-sourc
 
 ## Engineering
 
-- **Async I/O via `io_uring`**: replace the current `cudaLaunchHostFunc + pread/pwrite` path in `integration.cpp` with `io_uring`, including verification of GUP compatibility for `ZONE_DEVICE` / `PCI_P2PDMA` pages on the target kernel.
+- **Batch / async I/O engines**: the batch API (`phxfs_batch_submit_read/write` + `phxfs_batch_wait`) now runs on an `io_uring` engine behind a NUMA thread pool (sync fallback). Remaining work: a `libaio` engine, GUP-compatibility verification for `ZONE_DEVICE` / `PCI_P2PDMA` pages across target kernels, and error-injection / lifecycle test coverage.
 - **Large-region registration**: `>32 GiB` single `regmem` still fails because the mapping descriptor uses `kmalloc`; convert it to `kvalloc` (verify `kvfree` is safe in the vendor driver callback context).
 - **Broader kernel support**: validate and document supported kernel versions beyond the tested 6.1; provide DKMS packaging for the `phxfs` module.
 - **Packaging & distribution**: produce wheel / deb artifacts for `libphoenix` and `phxloader`; CI to build and smoke-test on reference kernels.
 - **Correctness regression suite**: expand `test/` (e.g. `>2 GiB` registration + offset verification) and wire into CI.
-- **Bug intelligence (MCP)**: a lightweight local collector (`scripts/collect_bug_info.sh`) already structures bug reports. A future **MCP server** will aggregate bug reports across users to build a shared knowledge base for faster triage. *Planned, not yet implemented.*
+- **Bug intelligence (MCP)**: a lightweight local collector for structured bug reports, plus a future **MCP server** to aggregate reports across users into a shared knowledge base for faster triage. *Planned, not yet implemented.*
 
 ## Research
 

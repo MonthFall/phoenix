@@ -32,19 +32,22 @@ do not read the whole tree.
    `module/amd-backend.c` first — see `doc/kernel-module.md`).
 4. Install: `sudo make insmod`. On "Operation not permitted", the GPU BAR is held — see
    `doc/troubleshooting.md` (free `/dev/nvidia*` users, unload `nvidia_drm`).
-5. Test: run `./bin/test_regmem 0` and `./bin/test_io 0` from `build/` (registration
-   lifecycle + I/O correctness/performance), or `sudo ./bin/example <file> <size> <mode>`.
+5. Test: run `./bin/test_regmem 0`, `./bin/test_io 0`, and `./bin/test_batch` from `build/`
+   (registration lifecycle, single-request I/O, and batch I/O correctness/performance).
    Inspect `dmesg | grep phxfs` for module messages.
 6. Remove when done: `sudo make rmmod`.
 
 ## Workflow 2 — Work on the user library
 
-- `libphoenix/` is the C/C++ API (`phxfs_open/close`, `regmem/deregmem`, `read/write`).
+- `libphoenix/` is the C/C++ API (`phxfs_open/close`, `regmem/deregmem`, `read/write`, and
+  the batch API `phxfs_*_batch` + async `phxfs_batch_submit_*`/`phxfs_batch_wait`).
 - Vendor-specific calls (CUDA, HIP, ...) live only in `libphoenix/connectors/<vendor>_connector.cpp`.
-  Core files (`phoenix.cpp`, `integration.cpp`) call through the `devconn` function-pointer
-  table and must stay vendor-agnostic — never add `#include <cuda.h>` etc. there.
-- Async I/O today is `cudaLaunchHostFunc + pread/pwrite` via `devconn->launch_async()`
-  (NOT io_uring yet — planned).
+  Core file `phoenix.cpp` calls through the `devconn` function-pointer table and must stay
+  vendor-agnostic — never add `#include <cuda.h>` etc. there.
+- Batch/async I/O runs on a pluggable engine (`io_engine_*`) behind a NUMA thread pool
+  (`io_pool.cpp`), chosen at load: `io_uring` → `sync` fallback. The old stream-based
+  `phxfs_read_async/write_async` were removed (application-side stream integration lives
+  in the adapter).
 
 ## Workflow 3 — Upper-layer application integration
 
@@ -52,16 +55,14 @@ do not read the whole tree.
   (via pybind11) and a `phxsafetensors` vLLM `load_format`. Pattern: parse model/weights →
   register a shared GPU buffer via `libphoenix` → `phxfs_read` DMA into GPU → `deregmem`.
 - New adapters (e.g. lmcache): register a GPU buffer through `libphoenix` and transfer with
-  `phxfs_read`/`phxfs_write`; follow the vLLM adapter structure. Place under `adapters/<app>/`.
+  the batch API (`phxfs_*_batch`) or `phxfs_read`/`phxfs_write`; follow the vLLM adapter
+  structure. Place under `adapters/<app>/`.
 
 ## Workflow 4 — Understand and report a bug
 
 1. Reproduce and capture `dmesg | grep phxfs`, module load state, and the failing command.
-2. Run the structured collector:
-   ```shell
-   bash scripts/collect_bug_info.sh
-   ```
-3. Open an issue with `.github/ISSUE_TEMPLATE/bug_report.md`, pasting the collector output
+2. Gather environment info: `uname -r`, `nvidia-smi`, `lsmod | grep phxfs`, and relevant `dmesg`.
+3. Open an issue with `.github/ISSUE_TEMPLATE/bug_report.md`, pasting the environment info
    and clear reproduction steps.
 4. (Future) A shared MCP server will aggregate these reports across users for faster triage
    — see `doc/roadmap.md`. Until then, keep reports in issues.
@@ -73,4 +74,3 @@ do not read the whole tree.
   `PHXFS_IO_CHUNK` (1 GiB) for `read`/`write`.
 - Only one `PHXFS_VENDOR` backend is compiled in per build; mixed-vendor machines are
   not supported. AMD/Huawei backends are not yet implemented (interfaces are ready).
-- `scripts/*.sh`/`*.py` hardcode dataset paths and are env-specific; not part of the build.

@@ -28,8 +28,13 @@ static ssize_t do_one(struct phxfs_io_op_req *r, enum phxfs_io_op op) {
         ssize_t ret = (op == PHXFS_IO_READ)
             ? pread(r->fd, base + done, chunk, r->f_offset + (off_t)done)
             : pwrite(r->fd, base + done, chunk, r->f_offset + (off_t)done);
-        if (ret < 0)
-            return -errno;
+        if (ret < 0) {
+            if (errno == EINTR)
+                continue;                        /* P1-7: retry */
+            /* Return partial progress if any, else the negative errno, to
+             * match phxfs_read/write's unified semantics. */
+            return done > 0 ? (ssize_t)done : -errno;
+        }
         if (ret == 0)
             break;  /* EOF */
         done += (size_t)ret;

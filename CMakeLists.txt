@@ -207,8 +207,27 @@ add_library(libphoenix ${libphoenix_source} ${devconn_source} ${libphoenix_inclu
 set_target_properties (libphoenix PROPERTIES OUTPUT_NAME "phoenix")
 target_include_directories(libphoenix PRIVATE "${libphoenix_root}")
 
+# Export only the public C API; hide internal symbols (P2-6). The linker
+# version script (local: *) demotes everything not listed to local, so we do
+# NOT also use -fvisibility=hidden (that would mark symbols STV_HIDDEN at
+# compile time, which the script's `global:` list cannot re-export).
+target_link_options(libphoenix PRIVATE
+    "-Wl,--version-script=${libphoenix_root}/libphoenix.map")
+
+# Prevent the compiler from emitting STB_GNU_UNIQUE symbols (e.g. std::string
+# template instantiations such as _M_mutate). The version script's `local: *`
+# cannot demote GNU-unique symbols, so without this they would still leak into
+# the dynamic export table (P2-4). GCC-only flag.
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(libphoenix PRIVATE -fno-gnu-unique)
+endif ()
+
+# The library itself depends on cudart (nvidia_connector) and pthreads (io
+# pool); declare them as link deps so libphoenix.so carries the right
+# DT_NEEDED and can be dlopen()'d standalone (P1-2), not left to consumers.
+target_link_libraries(libphoenix Threads::Threads)
 if (PHXFS_VENDOR STREQUAL "NVIDIA")
-    target_include_directories(libphoenix PRIVATE CUDA::cudart)
+    target_link_libraries(libphoenix CUDA::cudart)
 endif ()
 
 # Link liburing for the io_uring batch engine when available.
@@ -227,14 +246,13 @@ macro (set_multithread target)
     target_link_libraries (${target} Threads::Threads)
 endmacro ()
 
-# Output directories (shared by remaining targets, e.g. example/)
+# Output directories (shared by libphoenix and the test targets)
 set (CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set (CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set (CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
-# Benchmarks are not built (the directory is scheduled for removal).
-
 # Tests require CUDA (they use .cu files)
+enable_testing ()
 if (PHXFS_VENDOR STREQUAL "NVIDIA")
     add_subdirectory ("${PROJECT_SOURCE_DIR}/test/")
 endif ()

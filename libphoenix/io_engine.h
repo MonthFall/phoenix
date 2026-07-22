@@ -92,7 +92,8 @@ int phxfs_pool_run(struct phxfs_io_op_req *reqs, int n, enum phxfs_io_op op,
  */
 struct phxfs_pool_async;  /* opaque */
 struct phxfs_pool_async *phxfs_pool_submit(struct phxfs_io_op_req *reqs, int n,
-                                           enum phxfs_io_op op, int numa_node);
+                                           enum phxfs_io_op op, int numa_node,
+                                           bool blocking);
 int phxfs_pool_wait(struct phxfs_pool_async *h);
 
 #endif /* __PHXFS_IO_ENGINE_H__ */

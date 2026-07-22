@@ -30,3 +30,17 @@ add_dependencies (test_batch libphoenix)
 target_include_directories (test_batch PRIVATE "${phoenix_include}")
 target_link_libraries (test_batch libphoenix CUDA::cudart Threads::Threads)
 target_compile_definitions (test_batch PRIVATE TEST_FILE="${TEST_FILE}")
+
+# --- test_abi: standalone dlopen + exported-symbol whitelist (T6) ---
+add_executable (test_abi test_abi.cpp)
+add_dependencies (test_abi libphoenix)
+target_link_libraries (test_abi ${CMAKE_DL_LIBS})
+
+# CTest targets. `abi` needs no GPU/module/storage. `batch_cpu` runs the
+# module-free CPU-buffer correctness (it skips the GPU sections gracefully);
+# point it at a writable scratch path so it works in CI.
+enable_testing ()
+add_test (NAME abi COMMAND test_abi $<TARGET_FILE:libphoenix>)
+add_test (NAME batch_cpu COMMAND test_batch 1)
+set_tests_properties (batch_cpu PROPERTIES
+    ENVIRONMENT "PHXFS_TEST_FILE=${CMAKE_BINARY_DIR}/phxfs_ctest")

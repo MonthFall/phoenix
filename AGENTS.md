@@ -11,13 +11,10 @@ Phoenix is middleware for **direct I/O from storage to xPU (GPU/NPU)** via DMA, 
 | Path | Role |
 | --- | --- |
 | `module/` | `phxfs` kernel module — GPU BAR remap, per-GPU char device, `mmap`/`ioctl` P2P mapping; `phxfs-backend.*` + `nvidia-backend.c` select the P2P backend |
-| `libphoenix/` | User C/C++ lib — `phxfs_open/close`, `regmem/deregmem`, `read/write`, async (`integration.cpp`); `connectors/` holds the vendor `DevConnector` (`nvidia_connector.cpp`) |
+| `libphoenix/` | User C/C++ lib — `phxfs_open/close`, `regmem/deregmem`, `read/write`, batch + async batch (`phoenix.cpp`), pluggable I/O engines (`io_engine_*`, `io_pool.cpp`); `connectors/` holds the vendor `DevConnector` (`nvidia_connector.cpp`) |
 | `adapters/vLLM/phxloader/` | vLLM weight loader (safetensors → GPU DMA) via pybind11, published `phxloader` pkg |
 | `adapters/lmcache/` | (roadmap) KV-cache acceleration |
-| `example/` | Minimal end-to-end example |
-| `test/` | Correctness + performance tests (`test_regmem`, `test_io`) |
-| `scripts/` | Helper/eval scripts (paths are env-specific — users must edit) |
-| `third-party/fio/` | fio submodule for I/O testing |
+| `test/` | Correctness + performance tests (`test_regmem`, `test_io`, `test_batch`) |
 | `doc/` | All documentation (index: `doc/README.md`) |
 
 ## Build / test / install (reference environment)
@@ -37,19 +34,18 @@ Target a different vendor: `cmake -DPHXFS_VENDOR=AMD ../` (requires implementing
 
 **Kernel module work** — edit under `module/`; rebuild with `make` in `build/`; `sudo make insmod`. Watch `dmesg` for `phxfs*` messages. If `insmod` fails with "Operation not permitted", the GPU BAR is held by another process/driver (see `doc/troubleshooting.md`). Vendor-specific P2P calls live only in `<vendor>-backend.c`; core files (`phxfs.c`, `phxfs-mem.c`, `phxfs-p2p-service.c`) call through the `phxfs_p2p` function-pointer table and must stay vendor-agnostic.
 
-**Library / API work** — edit `libphoenix/`; `libphoenix.so` is consumed by adapters via pybind11. Vendor-specific calls (CUDA, HIP, ...) live only in `libphoenix/connectors/<vendor>_connector.cpp`; core files (`phoenix.cpp`, `integration.cpp`) call through the `devconn` function-pointer table and must stay vendor-agnostic.
+**Library / API work** — edit `libphoenix/`; `libphoenix.so` is consumed by adapters via pybind11. Vendor-specific calls (CUDA, HIP, ...) live only in `libphoenix/connectors/<vendor>_connector.cpp`; core files (`phoenix.cpp`) call through the `devconn` function-pointer table and must stay vendor-agnostic.
 
 **App integration** — vLLM: `adapters/vLLM/phxloader` exposes `PhxLoader` and a `phxsafetensors` load_format. New adapters register a GPU buffer via `libphoenix` and DMA through `phxfs_read`/`phxfs_write`.
 
-**Bug reporting** — run `bash scripts/collect_bug_info.sh` to produce a structured report, then open an issue using `.github/ISSUE_TEMPLATE/bug_report.md`.
+**Bug reporting** — gather environment info (`uname -r`, `nvidia-smi`, `lsmod | grep phxfs`, relevant `dmesg`), then open an issue using `.github/ISSUE_TEMPLATE/bug_report.md`.
 
 ## Gotchas (read before changing core code)
 
 - **BAR exclusivity**: only one driver may own the GPU PCIe BAR. Phoenix must be inserted when no other process/driver uses it.
 - **Registration size limit**: `regmem` > 32 GiB still fails (mapping descriptor uses `kmalloc`). Large transfers are chunked at `PHXFS_IO_CHUNK` (1 GiB) for `read`/`write` to stay under `MAX_RW_COUNT`.
-- **Async I/O**: current async path is `cudaLaunchHostFunc + pread/pwrite` (via `devconn->launch_async`), **not** `io_uring` yet (planned).
+- **Async I/O**: async is exposed only through the batch API (`phxfs_batch_submit_read/write` + `phxfs_batch_wait`), backed by the NUMA thread pool and the `io_uring` engine (sync fallback). The old stream-based `phxfs_read_async/write_async` were removed — application-side stream integration lives in the adapter.
 - **Single vendor per machine**: only one `PHXFS_VENDOR` backend is compiled in; mixed-vendor machines are not supported.
-- **Scripts are env-specific**: `scripts/*.sh`/`*.py` hardcode dataset paths (e.g. `/home/sc25/...`); they need editing per environment and are not part of the build.
 
 ## Where to look
 
