@@ -8,7 +8,7 @@ Phoenix is a rebuilt version of GPU Direct Storage (GDS) that lets data flow str
 ## 📰 News
 
 
-- **2026.7。21 batch I/O API** — `phxfs_read_batch`/`phxfs_write_batch` and async `phxfs_batch_submit_*`/`phxfs_batch_wait`, backed by an `io_uring` engine and a NUMA-aware thread pool; removes per-request syscall overhead for KV-cache / weight-loading workloads.
+- **2026.7.21 batch I/O API** — `phxfs_read_batch`/`phxfs_write_batch` and async `phxfs_batch_submit_*`/`phxfs_batch_wait`, backed by an `io_uring` engine and a NUMA-aware thread pool; removes per-request syscall overhead for KV-cache / weight-loading workloads.
 - **2026.7.10 phxloader released** — adapter for **vLLM**: safetensors weight loading via DMA straight into GPU memory (`--load-format phxsafetensors`).
 - **2025.12** — Phoenix paper accepted at [SC'25](https://doi.org/10.1145/3712285.3759862).
 
