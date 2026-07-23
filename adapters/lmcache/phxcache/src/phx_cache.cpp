@@ -11,8 +11,6 @@
 
 namespace {
 
-constexpr size_t GPU_PAGE_SIZE = 64 * 1024;  // HUGE_PAGE_SIZE in phoenix
-
 inline size_t align_up(size_t val, size_t alignment) {
     return (val + alignment - 1) & ~(alignment - 1);
 }
@@ -23,13 +21,13 @@ inline size_t align_up(size_t val, size_t alignment) {
 // PhxCache
 // ---------------------------------------------------------------------------
 
-PhxCache::PhxCache(int cuda_gpu_id)
-    : cuda_device_(cuda_gpu_id), initialized_(false) {
-    dev_ = phxfs_find_dev_for_cuda_gpu(cuda_gpu_id);
+PhxCache::PhxCache(int device_id)
+    : device_id_(device_id), initialized_(false) {
+    dev_ = phxfs_find_dev(device_id);
     if (dev_ < 0) {
         throw std::runtime_error(
-            "PhxCache: phxfs_find_dev_for_cuda_gpu(" +
-            std::to_string(cuda_gpu_id) + ") failed with " +
+            "PhxCache: phxfs_find_dev(" +
+            std::to_string(device_id) + ") failed with " +
             std::to_string(dev_));
     }
 
@@ -51,11 +49,12 @@ PhxCache::~PhxCache() {
     }
 }
 
-uintptr_t PhxCache::regmem(uintptr_t gpu_addr, size_t size) {
-    size_t aligned_size = align_up(size, GPU_PAGE_SIZE);
+uintptr_t PhxCache::regmem(uintptr_t dev_addr, size_t size) {
+    size_t page_size = phxfs_get_page_size();
+    size_t aligned_size = align_up(size, page_size);
 
     void *target_addr = nullptr;
-    int ret = phxfs_regmem(dev_, reinterpret_cast<const void *>(gpu_addr),
+    int ret = phxfs_regmem(dev_, reinterpret_cast<const void *>(dev_addr),
                            aligned_size, &target_addr);
     if (ret < 0) {
         throw std::runtime_error(
@@ -65,18 +64,18 @@ uintptr_t PhxCache::regmem(uintptr_t gpu_addr, size_t size) {
     }
 
     auto mapped = reinterpret_cast<uintptr_t>(target_addr);
-    reg_map_[gpu_addr] = {aligned_size, mapped};
+    reg_map_[dev_addr] = {aligned_size, mapped};
     return mapped;
 }
 
-void PhxCache::deregmem(uintptr_t gpu_addr, size_t size) {
-    auto it = reg_map_.find(gpu_addr);
+void PhxCache::deregmem(uintptr_t dev_addr, size_t size) {
+    auto it = reg_map_.find(dev_addr);
     if (it == reg_map_.end()) {
         return;  // Not registered, nothing to do
     }
 
     size_t aligned_size = it->second.first;
-    int ret = phxfs_deregmem(dev_, reinterpret_cast<const void *>(gpu_addr),
+    int ret = phxfs_deregmem(dev_, reinterpret_cast<const void *>(dev_addr),
                              aligned_size);
     if (ret < 0) {
         fprintf(stderr,
@@ -91,8 +90,8 @@ void PhxCache::close() {
     }
 
     // Deregister any remaining registered memory
-    for (const auto &[gpu_addr, info] : reg_map_) {
-        int ret = phxfs_deregmem(dev_, reinterpret_cast<const void *>(gpu_addr),
+    for (const auto &[dev_addr, info] : reg_map_) {
+        int ret = phxfs_deregmem(dev_, reinterpret_cast<const void *>(dev_addr),
                                  info.first);
         if (ret < 0) {
             fprintf(stderr,
@@ -106,6 +105,81 @@ void PhxCache::close() {
         fprintf(stderr, "PhxCache::close: phxfs_close failed with %d\n", ret);
     }
     initialized_ = false;
+}
+
+uint64_t PhxCache::page_size() const {
+    return phxfs_get_page_size();
+}
+
+// ---------------------------------------------------------------------------
+// PhxCache — batch I/O
+// ---------------------------------------------------------------------------
+
+std::vector<ssize_t> PhxCache::read_batch(
+        uintptr_t buf_base,
+        const std::vector<std::tuple<int, off_t, size_t, off_t>> &reqs) {
+
+    if (reqs.empty()) {
+        return {};
+    }
+
+    std::vector<phxfs_io_req_t> io_reqs(reqs.size());
+    for (size_t i = 0; i < reqs.size(); i++) {
+        io_reqs[i].fd         = std::get<0>(reqs[i]);
+        io_reqs[i].device_id  = dev_;               // GPU buffer (registered)
+        io_reqs[i].buf        = reinterpret_cast<void *>(buf_base);
+        io_reqs[i].buf_offset = std::get<1>(reqs[i]);
+        io_reqs[i].nbytes     = std::get<2>(reqs[i]);
+        io_reqs[i].f_offset   = std::get<3>(reqs[i]);
+        io_reqs[i].result     = 0;
+    }
+
+    int failed = phxfs_read_batch(io_reqs.data(),
+                                  static_cast<int>(io_reqs.size()));
+    if (failed < 0) {
+        throw std::runtime_error(
+            "PhxCache::read_batch: phxfs_read_batch failed with " +
+            std::to_string(failed));
+    }
+
+    std::vector<ssize_t> results(reqs.size());
+    for (size_t i = 0; i < reqs.size(); i++) {
+        results[i] = io_reqs[i].result;
+    }
+    return results;
+}
+
+std::vector<ssize_t> PhxCache::write_batch(
+        const std::vector<std::tuple<int, uintptr_t, off_t, size_t, off_t>> &reqs) {
+
+    if (reqs.empty()) {
+        return {};
+    }
+
+    std::vector<phxfs_io_req_t> io_reqs(reqs.size());
+    for (size_t i = 0; i < reqs.size(); i++) {
+        io_reqs[i].fd         = std::get<0>(reqs[i]);
+        io_reqs[i].device_id  = -1;                 // CPU buffer (no regmem)
+        io_reqs[i].buf        = reinterpret_cast<void *>(std::get<1>(reqs[i]));
+        io_reqs[i].buf_offset = std::get<2>(reqs[i]);
+        io_reqs[i].nbytes     = std::get<3>(reqs[i]);
+        io_reqs[i].f_offset   = std::get<4>(reqs[i]);
+        io_reqs[i].result     = 0;
+    }
+
+    int failed = phxfs_write_batch(io_reqs.data(),
+                                   static_cast<int>(io_reqs.size()));
+    if (failed < 0) {
+        throw std::runtime_error(
+            "PhxCache::write_batch: phxfs_write_batch failed with " +
+            std::to_string(failed));
+    }
+
+    std::vector<ssize_t> results(reqs.size());
+    for (size_t i = 0; i < reqs.size(); i++) {
+        results[i] = io_reqs[i].result;
+    }
+    return results;
 }
 
 // ---------------------------------------------------------------------------
@@ -152,30 +226,6 @@ ssize_t PhxFile::read(uintptr_t buf, off_t buf_offset, ssize_t nbyte,
     return result;
 }
 
-std::shared_ptr<AsyncReadResult> PhxFile::read_async(uintptr_t buf, size_t nbytes,
-                                                     off_t offset, uintptr_t stream) {
-    // Heap-allocate: phxfs_read_async stores a raw pointer to bytes_done_
-    // and updates it asynchronously when the DMA completes.  The object
-    // must survive until the caller calls stream.synchronize().
-    auto result = std::make_shared<AsyncReadResult>();
-    CUstream cu_stream = reinterpret_cast<CUstream>(stream);
-
-    cudaError_t err = phxfs_read_async(
-        fid_,
-        reinterpret_cast<void *>(buf),
-        nbytes,
-        offset,
-        result->ptr(),
-        cu_stream);
-
-    if (err != cudaSuccess) {
-        throw std::runtime_error(
-            std::string("PhxFile::read_async: phxfs_read_async failed: ") +
-            cudaGetErrorString(err));
-    }
-    return result;
-}
-
 ssize_t PhxFile::write(uintptr_t buf, off_t buf_offset, ssize_t nbyte,
                        off_t f_offset) {
     ssize_t result = phxfs_write(
@@ -188,27 +238,6 @@ ssize_t PhxFile::write(uintptr_t buf, off_t buf_offset, ssize_t nbyte,
         throw std::runtime_error(
             "PhxFile::write: phxfs_write failed with " +
             std::to_string(result));
-    }
-    return result;
-}
-
-std::shared_ptr<AsyncReadResult> PhxFile::write_async(uintptr_t buf, size_t nbytes,
-                                                      off_t offset, uintptr_t stream) {
-    auto result = std::make_shared<AsyncReadResult>();
-    CUstream cu_stream = reinterpret_cast<CUstream>(stream);
-
-    cudaError_t err = phxfs_write_async(
-        fid_,
-        reinterpret_cast<void *>(buf),
-        nbytes,
-        offset,
-        result->ptr(),
-        cu_stream);
-
-    if (err != cudaSuccess) {
-        throw std::runtime_error(
-            std::string("PhxFile::write_async: phxfs_write_async failed: ") +
-            cudaGetErrorString(err));
     }
     return result;
 }
