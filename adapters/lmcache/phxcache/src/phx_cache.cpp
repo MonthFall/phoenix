@@ -193,8 +193,8 @@ PhxFile::PhxFile(const PhxCache &cache, const std::string &path, int flags)
         throw std::system_error(errno, std::system_category(),
                                 "PhxFile: open(" + path + ")");
     }
-    fid_.fd = fd;
-    fid_.deviceID = cache.device_id();
+    fd_ = fd;
+    dev_ = cache.device_id();
     owns_fd_ = true;
 }
 
@@ -210,7 +210,7 @@ PhxFile::~PhxFile() {
 ssize_t PhxFile::read(uintptr_t buf, off_t buf_offset, ssize_t nbyte,
                       off_t f_offset) {
     ssize_t result = phxfs_read(
-        fid_,
+        fd_, dev_,
         reinterpret_cast<void *>(buf),
         buf_offset,
         nbyte,
@@ -229,7 +229,7 @@ ssize_t PhxFile::read(uintptr_t buf, off_t buf_offset, ssize_t nbyte,
 ssize_t PhxFile::write(uintptr_t buf, off_t buf_offset, ssize_t nbyte,
                        off_t f_offset) {
     ssize_t result = phxfs_write(
-        fid_,
+        fd_, dev_,
         reinterpret_cast<void *>(buf),
         buf_offset,
         nbyte,
@@ -244,7 +244,7 @@ ssize_t PhxFile::write(uintptr_t buf, off_t buf_offset, ssize_t nbyte,
 
 void PhxFile::close() {
     if (owns_fd_) {
-        ::close(fid_.fd);
+        ::close(fd_);
         owns_fd_ = false;
     }
 }

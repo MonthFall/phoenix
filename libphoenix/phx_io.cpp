@@ -75,58 +75,58 @@ static ssize_t xfer(int fd, void *host, ssize_t nbyte, off_t f_offset, bool is_w
  * device_id <  0: `buf` is a plain CPU (host) address — same convention as
  * the batch API, so a single request behaves the same as a 1-element batch.
  */
-ssize_t phxfs_read(phxfs_fileid_t fid, void *buf, off_t buf_offset, ssize_t nbyte, off_t f_offset){
+ssize_t phxfs_read(int fd, int device_id, void *buf, off_t buf_offset, ssize_t nbyte, off_t f_offset){
     if (nbyte < 0 || f_offset < 0 ||
         (uint64_t)nbyte > (uint64_t)INT64_MAX - (uint64_t)f_offset)
         return -EINVAL;
 
-    if (fid.deviceID < 0) {
+    if (device_id < 0) {
         void *host = NULL;
         int r = resolve_cpu_buf(buf, buf_offset, (size_t)nbyte, &host);
         if (r != 0)
             return r;
-        return xfer(fid.fd, host, nbyte, f_offset, /*is_write=*/false);
+        return xfer(fd, host, nbyte, f_offset, /*is_write=*/false);
     }
 
-    phxfs_mmap_buffer_t *pb = dev_get(fid.deviceID);
+    phxfs_mmap_buffer_t *pb = dev_get(device_id);
     if (!pb)
         return -1;
     void *host = NULL;
     phxfs_p2p_map_t *node = NULL;
-    if (resolve_registered(fid.deviceID, buf, buf_offset, (size_t)nbyte, &host, &node) != 1) {
+    if (resolve_registered(device_id, buf, buf_offset, (size_t)nbyte, &host, &node) != 1) {
         dev_put(pb);
         return -1;  /* not inside a registration on this device */
     }
-    ssize_t rc = xfer(fid.fd, host, nbyte, f_offset, /*is_write=*/false);
-    map_release(&mbuffer[fid.deviceID], node);
+    ssize_t rc = xfer(fd, host, nbyte, f_offset, /*is_write=*/false);
+    map_release(&mbuffer[device_id], node);
     dev_put(pb);
     return rc;
 }
 
-ssize_t phxfs_write(phxfs_fileid_t fid, void *buf, off_t buf_offset, ssize_t nbyte, off_t f_offset){
+ssize_t phxfs_write(int fd, int device_id, void *buf, off_t buf_offset, ssize_t nbyte, off_t f_offset){
     if (nbyte < 0 || f_offset < 0 ||
         (uint64_t)nbyte > (uint64_t)INT64_MAX - (uint64_t)f_offset)
         return -EINVAL;
 
-    if (fid.deviceID < 0) {
+    if (device_id < 0) {
         void *host = NULL;
         int r = resolve_cpu_buf(buf, buf_offset, (size_t)nbyte, &host);
         if (r != 0)
             return r;
-        return xfer(fid.fd, host, nbyte, f_offset, /*is_write=*/true);
+        return xfer(fd, host, nbyte, f_offset, /*is_write=*/true);
     }
 
-    phxfs_mmap_buffer_t *pb = dev_get(fid.deviceID);
+    phxfs_mmap_buffer_t *pb = dev_get(device_id);
     if (!pb)
         return -1;
     void *host = NULL;
     phxfs_p2p_map_t *node = NULL;
-    if (resolve_registered(fid.deviceID, buf, buf_offset, (size_t)nbyte, &host, &node) != 1) {
+    if (resolve_registered(device_id, buf, buf_offset, (size_t)nbyte, &host, &node) != 1) {
         dev_put(pb);
         return -1;  /* not inside a registration on this device */
     }
-    ssize_t rc = xfer(fid.fd, host, nbyte, f_offset, /*is_write=*/true);
-    map_release(&mbuffer[fid.deviceID], node);
+    ssize_t rc = xfer(fd, host, nbyte, f_offset, /*is_write=*/true);
+    map_release(&mbuffer[device_id], node);
     dev_put(pb);
     return rc;
 }

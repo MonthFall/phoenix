@@ -135,8 +135,7 @@ static void test_write_read_verify(int dev_id, size_t size) {
     int wfd = open(TEST_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     CHECK(wfd >= 0, "open file for write");
     if (wfd >= 0) {
-        phxfs_fileid_t fid = {.fd = wfd, .deviceID = dev_id};
-        ssize_t wr = phxfs_write(fid, gpu_buf, 0, size, 0);
+        ssize_t wr = phxfs_write(wfd, dev_id, gpu_buf, 0, size, 0);
         CHECK(wr == (ssize_t)size, "phxfs_write %zu bytes (got %zd)", size, wr);
         fsync(wfd);
         close(wfd);
@@ -150,8 +149,7 @@ static void test_write_read_verify(int dev_id, size_t size) {
     int rfd = open(TEST_FILE, O_RDONLY | O_DIRECT);
     CHECK(rfd >= 0, "open file for read (O_DIRECT)");
     if (rfd >= 0) {
-        phxfs_fileid_t fid = {.fd = rfd, .deviceID = dev_id};
-        ssize_t rd = phxfs_read(fid, gpu_buf, 0, size, 0);
+        ssize_t rd = phxfs_read(rfd, dev_id, gpu_buf, 0, size, 0);
         CHECK(rd == (ssize_t)size, "phxfs_read %zu bytes (got %zd)", size, rd);
         close(rfd);
     }
@@ -206,12 +204,11 @@ static void test_partial_reads(int dev_id) {
     }
 
     {
-        phxfs_fileid_t fid = {.fd = rfd, .deviceID = dev_id};
         bool all_ok = true;
 
         for (size_t off = 0; off < total; off += chunk) {
             size_t sz = (total - off < chunk) ? (total - off) : chunk;
-            ssize_t rd = phxfs_read(fid, gpu_buf, off, sz, off);
+            ssize_t rd = phxfs_read(rfd, dev_id, gpu_buf, off, sz, off);
             if (rd != (ssize_t)sz) {
                 printf("    read at offset %zu returned %zd (expected %zu)\n",
                        off, rd, sz);
@@ -276,7 +273,6 @@ static void test_multiple_io_rounds(int dev_id) {
     }
 
     {
-        phxfs_fileid_t fid = {.fd = rfd, .deviceID = dev_id};
         bool all_ok = true;
 
         for (int r = 0; r < rounds && all_ok; r++) {
@@ -284,7 +280,7 @@ static void test_multiple_io_rounds(int dev_id) {
             cudaMemset(gpu_buf, 0xFF, size);
             cudaDeviceSynchronize();
 
-            ssize_t rd = phxfs_read(fid, gpu_buf, 0, size, foff);
+            ssize_t rd = phxfs_read(rfd, dev_id, gpu_buf, 0, size, foff);
             if (rd != (ssize_t)size) {
                 CHECK(false, "round %d: read returned %zd", r, rd);
                 all_ok = false;
@@ -356,15 +352,13 @@ static void test_read_perf(int dev_id) {
             continue;
         }
 
-        phxfs_fileid_t fid = {.fd = rfd, .deviceID = dev_id};
-
         // Warm up
-        phxfs_read(fid, gpu_buf, 0, size, 0);
+        phxfs_read(rfd, dev_id, gpu_buf, 0, size, 0);
         posix_fadvise(rfd, 0, 0, POSIX_FADV_DONTNEED);
 
         // Timed run
         double t0 = now_sec();
-        ssize_t rd = phxfs_read(fid, gpu_buf, 0, size, 0);
+        ssize_t rd = phxfs_read(rfd, dev_id, gpu_buf, 0, size, 0);
         double t1 = now_sec();
         close(rfd);
 
@@ -422,14 +416,12 @@ static void test_write_perf(int dev_id) {
             continue;
         }
 
-        phxfs_fileid_t fid = {.fd = wfd, .deviceID = dev_id};
-
         // Warm up
-        phxfs_write(fid, gpu_buf, 0, size, 0);
+        phxfs_write(wfd, dev_id, gpu_buf, 0, size, 0);
 
         // Timed run
         double t0 = now_sec();
-        ssize_t wr = phxfs_write(fid, gpu_buf, 0, size, 0);
+        ssize_t wr = phxfs_write(wfd, dev_id, gpu_buf, 0, size, 0);
         double t1 = now_sec();
         fsync(wfd);
         close(wfd);

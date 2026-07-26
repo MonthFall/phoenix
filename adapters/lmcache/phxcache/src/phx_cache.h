@@ -67,10 +67,10 @@ private:
 };
 
 /// Encapsulates a file opened for Phoenix I/O.
-/// Manages the POSIX fd and constructs phxfs_fileid_t for phxfs_read.
+/// Manages the POSIX fd passed to phxfs_read/phxfs_write.
 class PhxFile {
 public:
-    /// Open a file and construct phxfs_fileid_t{fd, device_id}
+    /// Open a file.
     /// \param cache  PhxCache instance (provides device_id)
     /// \param path   File path
     /// \param flags  open() flags (e.g. O_RDONLY | O_DIRECT)
@@ -81,16 +81,17 @@ public:
     PhxFile(const PhxFile &) = delete;
     PhxFile &operator=(const PhxFile &) = delete;
 
-    /// Synchronous read: phxfs_read(fid, buf, buf_offset, nbyte, f_offset)
+    /// Synchronous read: phxfs_read(fd, dev, buf, buf_offset, nbyte, f_offset)
     /// \return bytes read, or negative on error
     ssize_t read(uintptr_t buf, off_t buf_offset, ssize_t nbyte, off_t f_offset);
 
-    /// Synchronous write: phxfs_write(fid, buf, buf_offset, nbyte, f_offset)
+    /// Synchronous write: phxfs_write(fd, dev, buf, buf_offset, nbyte, f_offset)
     ssize_t write(uintptr_t buf, off_t buf_offset, ssize_t nbyte, off_t f_offset);
 
     void close();
 
 private:
-    phxfs_fileid_t fid_;
+    int fd_;
+    int dev_;
     bool owns_fd_;
 };

@@ -43,11 +43,11 @@ Drops one reference on the registration. The last reference waits for in-flight 
 `phxfs_read` / `phxfs_write` transfer data directly between a file descriptor and the registered (GPU-backed) VMA:
 
 ```c++
-ssize_t phxfs_read (phxfs_fileid_t fid, void *buf, off_t buf_offset, ssize_t nbyte, off_t f_offset);
-ssize_t phxfs_write(phxfs_fileid_t fid, void *buf, off_t buf_offset, ssize_t nbyte, off_t f_offset);
+ssize_t phxfs_read (int fd, int device_id, void *buf, off_t buf_offset, ssize_t nbyte, off_t f_offset);
+ssize_t phxfs_write(int fd, int device_id, void *buf, off_t buf_offset, ssize_t nbyte, off_t f_offset);
 ```
 
-`fid.deviceID` selects the buffer the same way as the batch API below: `>= 0` means `buf` must lie inside a registration on that phxfs device; `< 0` means `buf` is a plain CPU (host) address. For a registered buffer, `buf` may point anywhere inside the region; the host DMA address is resolved as `vaddr + (buf - registered_base) + buf_offset`, and an internal reference on the mapping is held for the transfer's duration, so a concurrent `phxfs_deregmem` cannot unmap it mid-I/O. Large transfers are chunked at `PHXFS_IO_CHUNK` (1 GiB) to stay under the kernel's `MAX_RW_COUNT`.
+`device_id` selects the buffer the same way as the batch API below: `>= 0` means `buf` must lie inside a registration on that phxfs device; `< 0` means `buf` is a plain CPU (host) address. For a registered buffer, `buf` may point anywhere inside the region; the host DMA address is resolved as `vaddr + (buf - registered_base) + buf_offset`, and an internal reference on the mapping is held for the transfer's duration, so a concurrent `phxfs_deregmem` cannot unmap it mid-I/O. Large transfers are chunked at `PHXFS_IO_CHUNK` (1 GiB) to stay under the kernel's `MAX_RW_COUNT`.
 
 ## Batch I/O
 

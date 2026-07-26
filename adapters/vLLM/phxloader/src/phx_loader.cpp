@@ -114,10 +114,6 @@ void PhxLoader::load_tensors_into_buffer(
     }
 
     try {
-        phxfs_fileid_t fid;
-        fid.fd = fd;
-        fid.deviceID = dev_;
-
         // Serial phxfs_read for each batch item.
         // Each item is (buf_offset, file_offset, nbytes), all 4K-aligned
         // by the Python side (build_read_groups).
@@ -129,7 +125,7 @@ void PhxLoader::load_tensors_into_buffer(
             auto t_dma_start = std::chrono::steady_clock::now();
 
             ssize_t result = phxfs_read(
-                fid,
+                fd, dev_,
                 reinterpret_cast<void *>(gpu_ptr),
                 buf_offset,
                 static_cast<ssize_t>(nbytes),

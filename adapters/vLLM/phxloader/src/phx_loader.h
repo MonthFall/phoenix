@@ -16,7 +16,7 @@ int phxfs_open(int device_id);
 int phxfs_close(int device_id);
 int phxfs_find_dev(int device_id);
 uint64_t phxfs_get_page_size(void);
-ssize_t phxfs_read(struct phxfs_fileid fid, void *buf, off_t buf_offset,
+ssize_t phxfs_read(int fd, int device_id, void *buf, off_t buf_offset,
                     ssize_t nbyte, off_t f_offset);
 int phxfs_regmem(int device_id, const void *addr, size_t len,
                  void **target_addr);
