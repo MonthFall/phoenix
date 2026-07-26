@@ -95,7 +95,6 @@ int            phxfs_batch_destroy(phxfs_batch_t *handle);
 
 Submitted batches queue up on a bounded FIFO and run one at a time with the pool's full worker set, so several submits can be pipelined ahead (e.g. layerwise prefetch); if the queue is full, submit fails with `NULL` + `errno == EBUSY`. An empty batch (`n <= 0`) returns a valid handle whose `wait` returns `0`, matching the synchronous API.
 
-There is no vendor stream involved: the application drives its own CUDA/HIP stream and interleaves `submit` → compute → `wait` as it sees fit. (The former stream-based `phxfs_read_async` / `phxfs_write_async` were removed; this belongs on the application/adapter side.)
 
 ### Lifetime & concurrency contract
 

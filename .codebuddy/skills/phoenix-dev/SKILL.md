@@ -47,9 +47,7 @@ do not read the whole tree.
   Core files (`phx_device.cpp`, `phx_mem.cpp`, `phx_io.cpp`) call through the `devconn` function-pointer table and must stay
   vendor-agnostic — never add `#include <cuda.h>` etc. there.
 - Batch/async I/O runs on a pluggable engine (`io_engine/io_engine_*.cpp`) behind a worker
-  pool (`io_engine/io_pool.cpp`), chosen at load: `io_uring` → `sync` fallback. The old
-  stream-based `phxfs_read_async/write_async` were removed (application-side stream
-  integration lives in the adapter).
+  pool (`io_engine/io_pool.cpp`), chosen at load: `io_uring` → `sync` fallback. 
 
 ## Workflow 3 — Upper-layer application integration
 
