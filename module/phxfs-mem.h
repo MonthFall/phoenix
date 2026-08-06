@@ -11,7 +11,7 @@
 #define PHXFS_MAX_SHADOW_ALLOCS_ORDER 12
 
 struct phxfs_mmap_buffer {
-    atomic_t ref;
+    atomic_t ref;   /* one reference per VMA that carries this buffer */
     struct hlist_node hash_link;
     u64 c_vaddr; // mmap cpu vaddr
     u64 map_len; // mmap len
@@ -28,6 +28,8 @@ struct phxfs_mmap_buffer {
     struct phxfs_dev *dev;
     bool remap; // if vma remap_pfn_range set true, otherwise false
     struct p2p_vmap* map;
+    u64 *unit_starts;/* staging BAR units referenced by this buffer */
+    unsigned int nr_units;
 };
 typedef struct phxfs_mmap_buffer* phxfs_mmap_buffer_t;
 

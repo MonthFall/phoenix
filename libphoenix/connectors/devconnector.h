@@ -40,6 +40,48 @@ struct devconn_ops {
      * Returns phxfs device index (>=0) or -1 on failure.
      */
     int   (*find_device)(int device_id);
+
+    /*
+     * Staging-mode device-memory operations (may be NULL for vendors that
+     * do not support the staging path yet; the core checks before use).
+     *
+     * mem_alloc:   allocate `size` bytes of device memory on the accelerator
+     *              backing phxfs device index `phxfs_dev`. Returns 0 and sets
+     *              *dptr, or a negative errno.
+     * mem_free:    release a buffer from mem_alloc.
+     * memcpy_dtod: synchronous device-to-device copy (dst and src are both
+     *              device pointers). Returns 0 or a negative errno.
+     */
+    int   (*mem_alloc)(int phxfs_dev, size_t size, void **dptr);
+    void  (*mem_free)(void *dptr);
+    int   (*memcpy_dtod)(void *dst, const void *src, size_t n);
+
+    /*
+     * Asynchronous device-to-device copy on a connector-owned queue, plus a
+     * barrier for it. `slot` selects one of a small fixed set of queues per
+     * device (0 .. PHX_STAGING_SLOTS-1), so the staging path can double-buffer
+     * without knowing anything about vendor stream/queue types.
+     *
+     * memcpy_dtod_async returns as soon as the copy is enqueued;
+     * queue_sync(phxfs_dev, slot) returns once every copy enqueued on that
+     * queue has completed (and reports any error they raised).
+     *
+     * Both may be NULL: the core then falls back to the synchronous
+     * memcpy_dtod above, so a vendor only needs the sync op to work.
+     */
+    int   (*memcpy_dtod_async)(int phxfs_dev, int slot, void *dst,
+                               const void *src, size_t n);
+    int   (*queue_sync)(int phxfs_dev, int slot);
+
+    /*
+     * Profiler range annotations (NVTX on NVIDIA, vendor equivalents
+     * elsewhere). Both may be NULL — the core checks before calling, so a
+     * vendor without a profiler API needs no stubs and pays nothing.
+     * Calls nest per thread: every push has exactly one pop.
+     * `name` only has to stay valid for the duration of the push call.
+     */
+    void  (*range_push)(const char *name);
+    void  (*range_pop)(void);
 };
 
 /*

@@ -53,6 +53,20 @@ int phxfs_debug = 0;
 module_param(phxfs_debug, int, 0644);
 MODULE_PARM_DESC(phxfs_debug, "Enable info-level logging (0=off, 1=on)");
 
+int phxfs_map_mode = PHXFS_MAP_MODE_DEFAULT;
+module_param(phxfs_map_mode, int, 0644);
+MODULE_PARM_DESC(phxfs_map_mode,
+	"BAR mapping mode: 1=staging (remap only a Phoenix staging pool on "
+	"demand; leaves user GPU memory unmapped so RDMA/peermem can still "
+	"register it) [default], 0=full BAR remap at load (direct SSD->GPU DMA; "
+	"opt-in via cmake -DPHXFS_MAP_MODE=full or phxfs_map_mode=0)");
+
+int phxfs_staging_release = 1;
+module_param(phxfs_staging_release, int, 0644);
+MODULE_PARM_DESC(phxfs_staging_release,
+	"Staging mode: unmap a BAR unit once no registration references it "
+	"(1=on [default], 0=keep every unit mapped until module unload)");
+
 #define PHXFS_PAT_PATH "/sys/kernel/debug/x86/pat_memtype_list"
 #define PHXFS_PAT_BUF_SIZE (64 * 1024) /* PAT file typically < 16 KiB */
 
@@ -359,6 +373,7 @@ static int phxfs_devm_memremap(struct phxfs_dev *phx_dev) {
 	/* Perform devm_memremap_pages for each segment */
 	phx_dev->segments = segs;
 	phx_dev->num_segments = 0;
+	phx_dev->seg_capacity = n_segments;
 
 	for (i = 0; i < n_segments; i++) {
 		struct dev_pagemap *pgmap;
@@ -477,6 +492,7 @@ fallback_single:
 		phx_dev->remap = 1;
 		phx_dev->segments = NULL;
 		phx_dev->num_segments = 0;
+		phx_dev->seg_capacity = 0;
 
 		phxfs_info("phxfs%d: fallback single-segment remap, va=0x%lx\n",
 		       phx_dev->idx, (unsigned long)phx_dev->pci_mem_va);
@@ -496,7 +512,370 @@ err_cleanup:
 	kfree(segs);
 	phx_dev->segments = NULL;
 	phx_dev->num_segments = 0;
+	phx_dev->seg_capacity = 0;
 	return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* Segment table (staging mode)                                */
+/*                                                                    */
+/* dev->segments is kept sorted by phys_start so that                 */
+/* phxfs_bar_offset_to_va() can binary-search it. In staging mode each */
+/* entry covers exactly one PHXFS_REMAP_UNIT_SIZE unit of the BAR      */
+/* (possibly clipped at the BAR end), so entries never partially       */
+/* overlap. All accesses are under dev->seg_lock.                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Index of the segment containing `phys`, or -1 if none. *ins (when non-NULL)
+ * receives the position at which a segment starting at `phys` must be inserted
+ * to keep the array sorted. Caller holds dev->seg_lock.
+ */
+static int seg_find_locked(struct phxfs_dev *dev, u64 phys, int *ins)
+{
+	int lo = 0, hi = dev->num_segments - 1;
+
+	while (lo <= hi) {
+		int mid = lo + (hi - lo) / 2;
+		u64 seg_start = dev->segments[mid].phys_start;
+		u64 seg_end = seg_start + dev->segments[mid].size;
+
+		if (phys < seg_start) {
+			hi = mid - 1;
+		} else if (phys >= seg_end) {
+			lo = mid + 1;
+		} else {
+			if (ins)
+				*ins = mid;
+			return mid;
+		}
+	}
+	if (ins)
+		*ins = lo;
+	return -1;
+}
+
+/* Make room for one more segment. Caller holds dev->seg_lock. */
+static int seg_reserve_one_locked(struct phxfs_dev *dev)
+{
+	struct phxfs_bar_segment *grown;
+	int newcap;
+
+	if (dev->num_segments + 1 <= dev->seg_capacity)
+		return 0;
+
+	newcap = dev->seg_capacity ? dev->seg_capacity * 2
+				: dev->num_segments + 8;
+	grown = krealloc(dev->segments, (size_t)newcap * sizeof(*grown),
+			 GFP_KERNEL);
+	if (!grown) {
+		phxfs_err("phxfs%d: segment array grow to %d failed\n",
+		       dev->idx, newcap);
+		return -ENOMEM;
+	}
+	dev->segments = grown;
+	dev->seg_capacity = newcap;
+	return 0;
+}
+
+/*
+ * Remap one BAR physical span [phys_start, phys_end) as an additional
+ * ZONE_DEVICE segment and insert it into dev->segments. The span must not
+ * overlap an existing segment. Caller holds dev->seg_lock.
+ */
+static int phxfs_remap_span_locked(struct phxfs_dev *phx_dev, u64 phys_start,
+				   u64 phys_end)
+{
+	struct dev_pagemap *pgmap;
+	struct pci_p2pdma_pagemap *p2p_pgmap;
+	void *va;
+	u64 size;
+	int ins = 0, ret;
+
+	if (!phx_dev || phys_end <= phys_start)
+		return -EINVAL;
+	size = phys_end - phys_start;
+
+	/*
+	 * An overlap would be rejected by devm_memremap_pages() anyway and
+	 * would break the "entries never partially overlap" invariant the
+	 * binary search relies on, so reject it up front.
+	 */
+	if (seg_find_locked(phx_dev, phys_start, &ins) >= 0 ||
+	    seg_find_locked(phx_dev, phys_end - 1, NULL) >= 0) {
+		phxfs_err("phxfs%d: span [0x%llx-0x%llx) overlaps an existing "
+		       "segment\n", phx_dev->idx, phys_start, phys_end);
+		return -EEXIST;
+	}
+
+	ret = seg_reserve_one_locked(phx_dev);
+	if (ret)
+		return ret;
+
+	p2p_pgmap = devm_kzalloc(&phx_dev->dev->dev,
+				 sizeof(struct pci_p2pdma_pagemap), GFP_KERNEL);
+	if (!p2p_pgmap)
+		return -ENOMEM;
+
+	pgmap = &p2p_pgmap->pgmap;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+	pgmap->range.start = phys_start;
+	pgmap->range.end = phys_end - 1;
+	pgmap->nr_range = 1;
+#else
+	pgmap->res.start = phys_start;
+	pgmap->res.end = phys_end - 1;
+	pgmap->res.flags = IORESOURCE_MEM;
+#endif
+	pgmap->type = MEMORY_DEVICE_PCI_P2PDMA;
+
+	va = devm_memremap_pages(&phx_dev->dev->dev, pgmap);
+	if (IS_ERR_OR_NULL(va)) {
+		long err = PTR_ERR(va);
+		phxfs_err("phxfs%d: staging devm_memremap_pages failed for "
+		       "[0x%llx-0x%llx), err=%ld\n",
+		       phx_dev->idx, phys_start, phys_end, err);
+		devm_kfree(&phx_dev->dev->dev, p2p_pgmap);
+		return err ? (int)err : -ENOMEM;
+	}
+
+	if (ins < phx_dev->num_segments)
+		memmove(&phx_dev->segments[ins + 1], &phx_dev->segments[ins],
+			(size_t)(phx_dev->num_segments - ins) *
+				sizeof(phx_dev->segments[0]));
+	phx_dev->segments[ins].phys_start = phys_start;
+	phx_dev->segments[ins].size = size;
+	phx_dev->segments[ins].va = va;
+	phx_dev->segments[ins].refcount = 0;   /* caller takes the reference */
+	phx_dev->segments[ins].p2p_pgmap = p2p_pgmap;
+	phx_dev->num_segments++;
+	/* Legacy compat field: keep it pointing at a pgmap owned by segments[],
+	 * so phxfs_cdev_del() does not free it twice. */
+	phx_dev->p2p_pgmap = phx_dev->segments[0].p2p_pgmap;
+	phx_dev->remap = 1;
+
+	phxfs_info("phxfs%d: staging segment remapped: [0x%llx-0x%llx), "
+	       "%llu MiB, va=0x%lx (segments=%d)\n",
+	       phx_dev->idx, phys_start, phys_end, size / (1024 * 1024),
+	       (unsigned long)va, phx_dev->num_segments);
+	return 0;
+}
+
+int phxfs_staging_ensure_units(struct phxfs_dev *dev, const u64 *phys,
+			       unsigned long n, u64 **out_units,
+			       unsigned int *out_nr_units)
+{
+	u64 bar_end;
+	u64 *units;
+	unsigned int nr_units = 0;
+	unsigned long i;
+	int ret = 0;
+
+	if (!dev || !phys || !out_units || !out_nr_units)
+		return -EINVAL;
+
+	*out_units = NULL;
+	*out_nr_units = 0;
+	if (n == 0)
+		return 0;
+
+	/*
+	 * One entry per page is the worst case (unsorted input); consecutive
+	 * pages sharing a unit collapse to one entry. Duplicate entries would
+	 * be harmless anyway -- ensure/put are symmetric per entry.
+	 */
+	units = kvmalloc_array(n, sizeof(*units), GFP_KERNEL);
+	if (!units)
+		return -ENOMEM;
+
+	bar_end = dev->paddr + dev->size;
+
+	mutex_lock(&dev->seg_lock);
+	for (i = 0; i < n; i++) {
+		u64 off, unit_start, unit_end;
+		int idx;
+
+		if (phys[i] < dev->paddr || phys[i] >= bar_end) {
+			phxfs_err("phxfs%d: pinned page 0x%llx outside BAR "
+			       "[0x%llx-0x%llx)\n", dev->idx, phys[i],
+			       dev->paddr, bar_end);
+			ret = -ERANGE;
+			break;
+		}
+
+		/* Align on a BAR-relative grid so a unit never straddles the
+		 * BAR base even if paddr is not unit-aligned. */
+		off = (phys[i] - dev->paddr) & ~(PHXFS_REMAP_UNIT_SIZE - 1);
+		unit_start = dev->paddr + off;
+
+		/* Fast path: same unit as the previous page. */
+		if (nr_units && units[nr_units - 1] == unit_start)
+			continue;
+
+		idx = seg_find_locked(dev, phys[i], NULL);
+		if (idx < 0) {
+			unit_end = unit_start + PHXFS_REMAP_UNIT_SIZE;
+			if (unit_end > bar_end)
+				unit_end = bar_end;
+			ret = phxfs_remap_span_locked(dev, unit_start, unit_end);
+			if (ret)
+				break;
+			idx = seg_find_locked(dev, phys[i], NULL);
+			if (idx < 0) {   /* cannot happen; be loud, not silent */
+				phxfs_err("phxfs%d: unit 0x%llx missing right "
+				       "after remap\n", dev->idx, unit_start);
+				ret = -EFAULT;
+				break;
+			}
+		}
+		dev->segments[idx].refcount++;
+		units[nr_units++] = unit_start;
+	}
+
+	if (ret) {
+		/* Roll back this call's references; created units stay mapped
+		 * with refcount 0, i.e. reusable. */
+		unsigned int u;
+
+		for (u = 0; u < nr_units; u++) {
+			int idx = seg_find_locked(dev, units[u], NULL);
+
+			if (idx >= 0 && dev->segments[idx].refcount > 0)
+				dev->segments[idx].refcount--;
+		}
+		mutex_unlock(&dev->seg_lock);
+		kvfree(units);
+		return ret;
+	}
+	mutex_unlock(&dev->seg_lock);
+
+	*out_units = units;
+	*out_nr_units = nr_units;
+	return 0;
+}
+
+/*
+ * True if every page of [phys_start, phys_start + size) is idle: refcount back
+ * to the single reference devm_memremap_pages() established and no user mapping
+ * left. memunmap_pages() waits for exactly this condition with an
+ * uninterruptible wait_for_completion(), so checking first turns a would-be
+ * hang into a skipped (retried) release.
+ */
+static bool unit_pages_idle(u64 phys_start, u64 size)
+{
+	unsigned long pfn = PHYS_PFN(phys_start);
+	unsigned long end = PHYS_PFN(phys_start + size);
+
+	for (; pfn < end; pfn++) {
+		struct page *page = pfn_to_page(pfn);
+
+		if (page_count(page) != 1 || page_mapcount(page) > 0)
+			return false;
+	}
+	return true;
+}
+
+/* Drop segment `idx` (caller holds dev->seg_lock and verified it is idle). */
+static void seg_unmap_locked(struct phxfs_dev *dev, int idx)
+{
+	struct phxfs_bar_segment *seg = &dev->segments[idx];
+	u64 phys_start = seg->phys_start;
+	u64 size = seg->size;
+
+	devm_memunmap_pages(&dev->dev->dev, &seg->p2p_pgmap->pgmap);
+	devm_kfree(&dev->dev->dev, seg->p2p_pgmap);
+
+	if (idx + 1 < dev->num_segments)
+		memmove(&dev->segments[idx], &dev->segments[idx + 1],
+			(size_t)(dev->num_segments - idx - 1) *
+				sizeof(dev->segments[0]));
+	dev->num_segments--;
+
+	/* Legacy compat field must never dangle (phxfs_cdev_del() reads it). */
+	dev->p2p_pgmap = dev->num_segments ? dev->segments[0].p2p_pgmap : NULL;
+	if (dev->num_segments == 0)
+		dev->remap = 0;
+
+	phxfs_info("phxfs%d: staging segment released: [0x%llx-0x%llx), "
+	       "%llu MiB (segments=%d)\n",
+	       dev->idx, phys_start, phys_start + size, size / (1024 * 1024),
+	       dev->num_segments);
+}
+
+static void phxfs_seg_release_work_fn(struct work_struct *work)
+{
+	struct phxfs_dev *dev = container_of(to_delayed_work(work),
+					     struct phxfs_dev, seg_release_work);
+	int busy = 0;
+	int i;
+
+	/* Full-mode segments are owned by probe and never refcounted. */
+	if (phxfs_map_mode != PHXFS_MAP_MODE_STAGING)
+		return;
+
+	mutex_lock(&dev->seg_lock);
+	for (i = 0; i < dev->num_segments; ) {
+		struct phxfs_bar_segment *seg = &dev->segments[i];
+
+		if (seg->refcount > 0 || !seg->va || !seg->p2p_pgmap) {
+			i++;
+			continue;
+		}
+		if (!unit_pages_idle(seg->phys_start, seg->size)) {
+			busy++;
+			i++;
+			continue;
+		}
+		seg_unmap_locked(dev, i);   /* array shifted: revisit index i */
+	}
+	if (busy && dev->seg_release_tries > 0) {
+		dev->seg_release_tries--;
+		schedule_delayed_work(&dev->seg_release_work,
+				      msecs_to_jiffies(200));
+	} else if (busy) {
+		phxfs_warn("phxfs%d: %d staging segment(s) still busy, leaving "
+		       "them mapped and reusable\n", dev->idx, busy);
+	}
+	mutex_unlock(&dev->seg_lock);
+}
+
+void phxfs_staging_put_units(struct phxfs_dev *dev, const u64 *units,
+			     unsigned int nr_units)
+{
+	bool freed = false;
+	unsigned int u;
+
+	if (!dev || !units || nr_units == 0)
+		return;
+
+	mutex_lock(&dev->seg_lock);
+	for (u = 0; u < nr_units; u++) {
+		int idx = seg_find_locked(dev, units[u], NULL);
+
+		if (idx < 0) {
+			phxfs_warn("phxfs%d: put of unknown unit 0x%llx\n",
+			       dev->idx, units[u]);
+			continue;
+		}
+		if (dev->segments[idx].refcount <= 0) {
+			phxfs_warn("phxfs%d: unbalanced put on unit 0x%llx\n",
+			       dev->idx, units[u]);
+			continue;
+		}
+		if (--dev->segments[idx].refcount == 0)
+			freed = true;
+	}
+	if (freed && phxfs_staging_release) {
+		dev->seg_release_tries = 25;   /* ~5 s of retries, then give up */
+		schedule_delayed_work(&dev->seg_release_work, 0);
+	}
+	mutex_unlock(&dev->seg_lock);
+}
+
+void phxfs_staging_release_cancel(struct phxfs_dev *dev)
+{
+	if (dev)
+		cancel_delayed_work_sync(&dev->seg_release_work);
 }
 
 static int phxfs_ctrl_init(struct phxfs_ctrl *dev_ctrl, u32 dev_num) {
@@ -528,12 +907,29 @@ static int phxfs_ctrl_init(struct phxfs_ctrl *dev_ctrl, u32 dev_num) {
 		dev_ctrl->phx_dev[i].remap = 0;
 		dev_ctrl->phx_dev[i].segments = NULL;
 		dev_ctrl->phx_dev[i].num_segments = 0;
+		dev_ctrl->phx_dev[i].seg_capacity = 0;
+		mutex_init(&dev_ctrl->phx_dev[i].seg_lock);
+		dev_ctrl->phx_dev[i].seg_release_tries = 0;
+		INIT_DELAYED_WORK(&dev_ctrl->phx_dev[i].seg_release_work,
+				  phxfs_seg_release_work_fn);
 		phxfs_info("npu%u: bus is %x, size is %llu, paddr is %llx\n", i,
 			dev_ctrl->phx_dev[i].dev->bus->number, dev_ctrl->phx_dev[i].size,
 			dev_ctrl->phx_dev[i].paddr);
-		ret = phxfs_devm_memremap(&dev_ctrl->phx_dev[i]);
-		if (ret)
-			return ret;
+		/*
+		 * Full mode remaps the whole BAR up front. Staging mode defers
+		 * the remap to the first registration (phxfs_map_dev_addr_inner),
+		 * where only the registered buffer's BAR span is remapped, so the
+		 * rest of the BAR keeps pfn_valid == false and stays registerable
+		 * by RDMA/peermem.
+		 */
+		if (phxfs_map_mode == PHXFS_MAP_MODE_FULL) {
+			ret = phxfs_devm_memremap(&dev_ctrl->phx_dev[i]);
+			if (ret)
+				return ret;
+		} else {
+			phxfs_info("phxfs%d: staging mode -- deferring BAR remap "
+			       "until first registration\n", i);
+		}
 	}
 	return 0;
 }
@@ -614,13 +1010,29 @@ static ssize_t pci_bdf_show(struct device *cdev_device,
 }
 static DEVICE_ATTR_RO(pci_bdf);
 
+/*
+ * Read-only sysfs handle exposing the active BAR mapping mode (global module
+ * param) per device, so libphoenix can adapt at open time via the same
+ * /sys/class/phxfs-generic/phxfs_devN/ path it already uses for pci_bdf.
+ */
+static ssize_t map_mode_show(struct device *cdev_device,
+                             struct device_attribute *attr, char *buf) {
+	if (WARN_ON(!buf))
+		return -EINVAL;
+	return sprintf(buf, "%d\n", phxfs_map_mode);
+}
+static DEVICE_ATTR_RO(map_mode);
+
 void phxfs_cdev_del(struct cdev *cdev, struct device *cdev_device,
                     struct phxfs_dev *dev) {
 	if (WARN_ON(!cdev || !cdev_device || !dev))
 		return;
 
 	device_remove_file(cdev_device, &dev_attr_pci_bdf);
+	device_remove_file(cdev_device, &dev_attr_map_mode);
 	cdev_device_del(cdev, cdev_device);
+	/* No release worker may run past this point: it touches dev->segments. */
+	phxfs_staging_release_cancel(dev);
 	if (dev->remap) {
 		if (dev->segments && dev->num_segments > 0) {
 			/* Multi-segment cleanup */
@@ -637,6 +1049,7 @@ void phxfs_cdev_del(struct cdev *cdev, struct device *cdev_device,
 			kfree(dev->segments);
 			dev->segments = NULL;
 			dev->num_segments = 0;
+			dev->seg_capacity = 0;
 			dev->p2p_pgmap = NULL; /* already freed per-segment above */
 		} else if (dev->p2p_pgmap) {
 			/* Legacy single-segment cleanup */
@@ -677,6 +1090,13 @@ int phxfs_cdev_add(struct cdev *cdev, struct device *cdev_device,
 	dev_set_drvdata(cdev_device, dev);
 	ret = device_create_file(cdev_device, &dev_attr_pci_bdf);
 	if (ret) {
+		cdev_device_del(cdev, cdev_device);
+		ida_simple_remove(&phxfs_chr_minor_ida, dev->idx);
+		return ret;
+	}
+	ret = device_create_file(cdev_device, &dev_attr_map_mode);
+	if (ret) {
+		device_remove_file(cdev_device, &dev_attr_pci_bdf);
 		cdev_device_del(cdev, cdev_device);
 		ida_simple_remove(&phxfs_chr_minor_ida, dev->idx);
 	}

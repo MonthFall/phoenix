@@ -345,11 +345,6 @@ static int uring_submit_batch(struct phxfs_io_op_req *reqs, int n,
 
     for (int i = 0; i < n; i++)
         reqs[i].result = 0;
-    /* Clear the per-slice errno stash for this batch's slice range. The stash
-     * is sized to PHXFS_SLICE_POOL and waves are processed serially, so we
-     * only need to clear what build_slices will touch this wave. */
-    for (int i = 0; i < PHXFS_SLICE_POOL; i++)
-        t_req_err[i] = 0;
 
     int rc = 0;
     /*
@@ -364,6 +359,12 @@ static int uring_submit_batch(struct phxfs_io_op_req *reqs, int n,
         size_t ns = build_slices(reqs, n, &cur_req, &cur_off);
         if (ns == 0)
             break;   /* defensive: no progress possible */
+        /* Clear only this wave's slice range of the errno stash. run_slices()
+         * leaves it clean on the normal path, but an early ring_reset() return
+         * can leave entries set, so clearing here (O(ns), not O(pool)) is what
+         * keeps waves independent. */
+        for (size_t i = 0; i < ns; i++)
+            t_req_err[i] = 0;
         rc = run_slices(reqs, ns, op);
         if (rc < 0)
             break;

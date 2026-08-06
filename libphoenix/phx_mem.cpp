@@ -205,6 +205,91 @@ void free_phxfs_p2p_map(phxfs_mmap_buffer_t *buffer) {
 /* Public API: regmem / deregmem                                      */
 /* ------------------------------------------------------------------ */
 
+int phx_regmem_internal(phxfs_mmap_buffer_t *pb, const void *addr, size_t len,
+                        void **target_addr) {
+    PHX_RANGE("phx.regmem");   /* mmap + ioctl MAP (kernel pin + BAR remap) */
+    /* Reuse an identical registration; reject a conflicting overlap. */
+    bool overlap = false;
+    pthread_mutex_lock(&pb->lock);
+    phxfs_p2p_map_t *dup = regmem_scan_locked(pb, (u64)addr, len, &overlap);
+    if (dup) {
+        dup->user_refs++;
+        *target_addr = dup->vaddr;
+        pthread_mutex_unlock(&pb->lock);
+        return 0;
+    }
+    if (overlap) {
+        pthread_mutex_unlock(&pb->lock);
+        fprintf(stderr, "%s: region overlaps an existing registration\n", __func__);
+        return -EINVAL;
+    }
+    pthread_mutex_unlock(&pb->lock);
+
+    phxfs_p2p_map_t *p2p_map = (phxfs_p2p_map_t *)malloc(sizeof(*p2p_map));
+    if (!p2p_map) {
+        return -ENOMEM;
+    }
+    p2p_map->vaddr = NULL;
+    p2p_map->length = len;
+    p2p_map->dev_addr = (uint64_t)addr;
+    p2p_map->has_reg = false;
+    p2p_map->mapped = false;
+    p2p_map->user_refs = 1;
+    p2p_map->refcount = 0;
+    p2p_map->next = NULL;
+
+    /* Single contiguous mmap of the whole region (kvmalloc backend: no 2GiB
+     * per-mmap limit). */
+    p2p_map->vaddr = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, pb->bdev_fd, 0);
+    if (p2p_map->vaddr == MAP_FAILED) {
+        fprintf(stderr, "%s: mmap fail (%s)\n", __func__, strerror(errno));
+        free(p2p_map);
+        return -EFAULT;
+    }
+    p2p_map->mapped = true;
+
+    int ret = __phxfs_regmem(pb, p2p_map->dev_addr, (uint64_t)p2p_map->vaddr, len);
+    if (ret) {
+        fprintf(stderr, "%s: __phxfs_regmem fail ret=%d (%s)\n", __func__, ret, strerror(errno));
+        munmap(p2p_map->vaddr, len);
+        free(p2p_map);
+        return -EFAULT;
+    }
+    p2p_map->has_reg = true;
+
+    /* Re-check under the lock for a concurrent identical creator; if one won,
+     * reuse it and drop our now-redundant mapping. */
+    pthread_mutex_lock(&pb->lock);
+    bool ov2 = false;
+    phxfs_p2p_map_t *dup2 = regmem_scan_locked(pb, (u64)addr, len, &ov2);
+    if (dup2) {
+        dup2->user_refs++;
+        *target_addr = dup2->vaddr;
+        pthread_mutex_unlock(&pb->lock);
+        __phxfs_deregmem(pb, p2p_map->dev_addr, (uint64_t)p2p_map->vaddr, len);
+        munmap(p2p_map->vaddr, len);
+        free(p2p_map);
+        return 0;
+    }
+    if (ov2) {
+        /* A different, partially-overlapping registration was inserted while
+         * we were mmap/ioctl'ing outside the lock. Honour the "overlap is
+         * rejected" contract: roll back our own mapping and fail. */
+        pthread_mutex_unlock(&pb->lock);
+        __phxfs_deregmem(pb, p2p_map->dev_addr, (uint64_t)p2p_map->vaddr, len);
+        munmap(p2p_map->vaddr, len);
+        free(p2p_map);
+        fprintf(stderr, "%s: region overlaps a concurrently-created registration\n", __func__);
+        return -EINVAL;
+    }
+    p2p_map->next = pb->head;   /* insert (lock held) */
+    pb->head = p2p_map;
+    pthread_mutex_unlock(&pb->lock);
+
+    *target_addr = p2p_map->vaddr;
+    return 0;
+}
+
 int phxfs_regmem(int device_id, const void *addr, size_t len, void **target_addr) {
     if (!addr || !target_addr) {
         fprintf(stderr, "%s: NULL addr/target_addr\n", __func__);
@@ -231,94 +316,21 @@ int phxfs_regmem(int device_id, const void *addr, size_t len, void **target_addr
         return -EINVAL;
     }
 
-    /* Reuse an identical registration; reject a conflicting overlap. */
-    bool overlap = false;
-    pthread_mutex_lock(&pb->lock);
-    phxfs_p2p_map_t *dup = regmem_scan_locked(pb, (u64)addr, len, &overlap);
-    if (dup) {
-        dup->user_refs++;
-        *target_addr = dup->vaddr;
-        pthread_mutex_unlock(&pb->lock);
+    /*
+     * Staging mode: user GPU buffers are NOT pinned/registered — the direct
+     * DMA landing zone is Phoenix's internal staging pool. Report success
+     * (a no-op) so callers keep the register-your-buffer contract while the
+     * buffer stays free of struct pages and registerable by RDMA/peermem.
+     */
+    if (pb->map_mode == PHX_MAP_MODE_STAGING) {
+        *target_addr = (void *)addr;
         dev_put(pb);
         return 0;
     }
-    if (overlap) {
-        pthread_mutex_unlock(&pb->lock);
-        fprintf(stderr, "%s: region overlaps an existing registration\n", __func__);
-        dev_put(pb);
-        return -EINVAL;
-    }
-    pthread_mutex_unlock(&pb->lock);
 
-    phxfs_p2p_map_t *p2p_map = (phxfs_p2p_map_t *)malloc(sizeof(*p2p_map));
-    if (!p2p_map) {
-        dev_put(pb);
-        return -ENOMEM;
-    }
-    p2p_map->vaddr = NULL;
-    p2p_map->length = len;
-    p2p_map->dev_addr = (uint64_t)addr;
-    p2p_map->has_reg = false;
-    p2p_map->mapped = false;
-    p2p_map->user_refs = 1;
-    p2p_map->refcount = 0;
-    p2p_map->next = NULL;
-
-    /* Single contiguous mmap of the whole region (kvmalloc backend: no 2GiB
-     * per-mmap limit). */
-    p2p_map->vaddr = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, pb->bdev_fd, 0);
-    if (p2p_map->vaddr == MAP_FAILED) {
-        fprintf(stderr, "%s: mmap fail (%s)\n", __func__, strerror(errno));
-        free(p2p_map);
-        dev_put(pb);
-        return -EFAULT;
-    }
-    p2p_map->mapped = true;
-
-    int ret = __phxfs_regmem(pb, p2p_map->dev_addr, (uint64_t)p2p_map->vaddr, len);
-    if (ret) {
-        fprintf(stderr, "%s: __phxfs_regmem fail ret=%d (%s)\n", __func__, ret, strerror(errno));
-        munmap(p2p_map->vaddr, len);
-        free(p2p_map);
-        dev_put(pb);
-        return -EFAULT;
-    }
-    p2p_map->has_reg = true;
-
-    /* Re-check under the lock for a concurrent identical creator; if one won,
-     * reuse it and drop our now-redundant mapping. */
-    pthread_mutex_lock(&pb->lock);
-    bool ov2 = false;
-    phxfs_p2p_map_t *dup2 = regmem_scan_locked(pb, (u64)addr, len, &ov2);
-    if (dup2) {
-        dup2->user_refs++;
-        *target_addr = dup2->vaddr;
-        pthread_mutex_unlock(&pb->lock);
-        __phxfs_deregmem(pb, p2p_map->dev_addr, (uint64_t)p2p_map->vaddr, len);
-        munmap(p2p_map->vaddr, len);
-        free(p2p_map);
-        dev_put(pb);
-        return 0;
-    }
-    if (ov2) {
-        /* A different, partially-overlapping registration was inserted while
-         * we were mmap/ioctl'ing outside the lock. Honour the "overlap is
-         * rejected" contract: roll back our own mapping and fail. */
-        pthread_mutex_unlock(&pb->lock);
-        __phxfs_deregmem(pb, p2p_map->dev_addr, (uint64_t)p2p_map->vaddr, len);
-        munmap(p2p_map->vaddr, len);
-        free(p2p_map);
-        fprintf(stderr, "%s: region overlaps a concurrently-created registration\n", __func__);
-        dev_put(pb);
-        return -EINVAL;
-    }
-    p2p_map->next = pb->head;   /* insert (lock held) */
-    pb->head = p2p_map;
-    pthread_mutex_unlock(&pb->lock);
-
-    *target_addr = p2p_map->vaddr;
+    int rc = phx_regmem_internal(pb, addr, len, target_addr);
     dev_put(pb);
-    return 0;
+    return rc;
 }
 
 /*
@@ -332,6 +344,14 @@ int phxfs_deregmem(int device_id, const void *addr, size_t len) {
     phxfs_mmap_buffer_t *pb = dev_get(device_id);
     if (!pb)
         return -1;
+
+    /* Mirror the staging-mode no-op registration: nothing was pinned for a
+     * user buffer, so there is nothing to tear down. (The staging pool itself
+     * is released during close, not here.) */
+    if (pb->map_mode == PHX_MAP_MODE_STAGING) {
+        dev_put(pb);
+        return 0;
+    }
 
     pthread_mutex_lock(&pb->lock);
     phxfs_p2p_map_t *m = pb->head;

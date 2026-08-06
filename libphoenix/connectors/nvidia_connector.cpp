@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -106,6 +107,204 @@ static int nvidia_find_device(int cuda_gpu_id)
 }
 
 /* ------------------------------------------------------------------ */
+/* Staging-mode device memory operations                              */
+/* ------------------------------------------------------------------ */
+
+/* Reverse of find_device: phxfs index -> CUDA device id, by matching the
+ * phxfs sysfs pci_bdf against each CUDA device's PCI bus id. Returns the CUDA
+ * device id (>=0) or -1. */
+static int nvidia_phxfs_to_cuda(int phxfs_dev)
+{
+    std::string sysfs_path = "/sys/class/phxfs-generic/phxfs_dev"
+                             + std::to_string(phxfs_dev) + "/pci_bdf";
+    std::ifstream ifs(sysfs_path);
+    if (!ifs.is_open())
+        return -1;
+    std::string sysfs_bdf;
+    if (!std::getline(ifs, sysfs_bdf))
+        return -1;
+    while (!sysfs_bdf.empty() &&
+           (sysfs_bdf.back() == '\n' || sysfs_bdf.back() == '\r' ||
+            sysfs_bdf.back() == ' '  || sysfs_bdf.back() == '\t'))
+        sysfs_bdf.pop_back();
+
+    int n_gpus = 0;
+    if (cudaGetDeviceCount(&n_gpus) != cudaSuccess)
+        return -1;
+    for (int g = 0; g < n_gpus; g++) {
+        char cuda_bdf[32];
+        if (cudaDeviceGetPCIBusId(cuda_bdf, sizeof(cuda_bdf), g) != cudaSuccess)
+            continue;
+        if (bdf_equal(cuda_bdf, sysfs_bdf))
+            return g;
+    }
+    return -1;
+}
+
+static int nvidia_mem_alloc(int phxfs_dev, size_t size, void **dptr)
+{
+    if (!dptr)
+        return -EINVAL;
+    int cuda_id = nvidia_phxfs_to_cuda(phxfs_dev);
+    if (cuda_id < 0) {
+        fprintf(stderr, "nvidia_mem_alloc: no CUDA device for phxfs dev %d\n",
+                phxfs_dev);
+        return -ENODEV;
+    }
+    /* Allocate on the phxfs device's accelerator, but restore the caller's
+     * current device afterwards so we don't disturb the application's CUDA
+     * context state. */
+    int prev = -1;
+    cudaGetDevice(&prev);
+    if (cudaSetDevice(cuda_id) != cudaSuccess)
+        return -EIO;
+    void *p = nullptr;
+    cudaError_t rc = cudaMalloc(&p, size);
+    if (prev >= 0)
+        cudaSetDevice(prev);
+    if (rc != cudaSuccess) {
+        fprintf(stderr, "nvidia_mem_alloc: cudaMalloc(%zu) failed: %s\n",
+                size, cudaGetErrorString(rc));
+        return -ENOMEM;
+    }
+    *dptr = p;
+    return 0;
+}
+
+static void nvidia_mem_free(void *dptr)
+{
+    if (dptr)
+        cudaFree(dptr);
+}
+
+/* Synchronous device-to-device copy. cudaMemcpy(...DeviceToDevice) does not
+ * return to the host until the copy has completed, which is the completion
+ * contract the staging path relies on. */
+static int nvidia_memcpy_dtod(void *dst, const void *src, size_t n)
+{
+    cudaError_t rc = cudaMemcpy(dst, src, n, cudaMemcpyDeviceToDevice);
+    if (rc != cudaSuccess) {
+        fprintf(stderr, "nvidia_memcpy_dtod: %s\n", cudaGetErrorString(rc));
+        return -EIO;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Asynchronous D2D: one stream per (phxfs device, staging slot)       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Non-blocking streams so the staging path's copies never serialise against
+ * the application's work on the legacy default stream. Created lazily on first
+ * use and kept for the process lifetime (a handful of streams per device).
+ */
+#define NV_MAX_QUEUES 4   /* per device; >= PHX_STAGING_SLOTS */
+
+static cudaStream_t    g_streams[PHXFS_DEV_SCAN_MAX][NV_MAX_QUEUES];
+static pthread_mutex_t g_stream_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Fetch (creating on first use) the stream for (phxfs_dev, slot). */
+static int nvidia_stream_get(int phxfs_dev, int slot, cudaStream_t *out)
+{
+    if (phxfs_dev < 0 || phxfs_dev >= PHXFS_DEV_SCAN_MAX ||
+        slot < 0 || slot >= NV_MAX_QUEUES)
+        return -EINVAL;
+
+    pthread_mutex_lock(&g_stream_lock);
+    if (g_streams[phxfs_dev][slot] == nullptr) {
+        int cuda_id = nvidia_phxfs_to_cuda(phxfs_dev);
+        if (cuda_id < 0) {
+            pthread_mutex_unlock(&g_stream_lock);
+            return -ENODEV;
+        }
+        /* A stream belongs to a device, so create it with that device current,
+         * then restore the caller's. */
+        int prev = -1;
+        cudaGetDevice(&prev);
+        if (cudaSetDevice(cuda_id) != cudaSuccess) {
+            pthread_mutex_unlock(&g_stream_lock);
+            return -EIO;
+        }
+        cudaStream_t s = nullptr;
+        cudaError_t rc = cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+        if (prev >= 0)
+            cudaSetDevice(prev);
+        if (rc != cudaSuccess) {
+            fprintf(stderr, "nvidia_stream_get: cudaStreamCreate: %s\n",
+                    cudaGetErrorString(rc));
+            pthread_mutex_unlock(&g_stream_lock);
+            return -EIO;
+        }
+        g_streams[phxfs_dev][slot] = s;
+    }
+    *out = g_streams[phxfs_dev][slot];
+    pthread_mutex_unlock(&g_stream_lock);
+    return 0;
+}
+
+static int nvidia_memcpy_dtod_async(int phxfs_dev, int slot, void *dst,
+                                    const void *src, size_t n)
+{
+    cudaStream_t s = nullptr;
+    int rc = nvidia_stream_get(phxfs_dev, slot, &s);
+    if (rc != 0)
+        return rc;
+
+    cudaError_t err = cudaMemcpyAsync(dst, src, n, cudaMemcpyDeviceToDevice, s);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "nvidia_memcpy_dtod_async: %s\n",
+                cudaGetErrorString(err));
+        return -EIO;
+    }
+    return 0;
+}
+
+static int nvidia_queue_sync(int phxfs_dev, int slot)
+{
+    if (phxfs_dev < 0 || phxfs_dev >= PHXFS_DEV_SCAN_MAX ||
+        slot < 0 || slot >= NV_MAX_QUEUES)
+        return -EINVAL;
+
+    /* No stream created => nothing was ever enqueued on it. */
+    pthread_mutex_lock(&g_stream_lock);
+    cudaStream_t s = g_streams[phxfs_dev][slot];
+    pthread_mutex_unlock(&g_stream_lock);
+    if (!s)
+        return 0;
+
+    cudaError_t err = cudaStreamSynchronize(s);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "nvidia_queue_sync: %s\n", cudaGetErrorString(err));
+        return -EIO;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Profiler ranges (NVTX)*/
+/* ------------------------------------------------------------------ */
+
+/*
+ * NVTX v3 is header-only, so this adds no link dependency. When no profiler is
+ * attached the calls collapse into a NULL-injection-pointer check inside NVTX
+ * itself. Compile out entirely with cmake -Dphx_nvtx=false.
+ */
+#ifdef PHX_NVTX
+#include <nvtx3/nvToolsExt.h>
+
+static void nvidia_range_push(const char *name)
+{
+    nvtxRangePushA(name);
+}
+
+static void nvidia_range_pop(void)
+{
+    nvtxRangePop();
+}
+#endif
+
+/* ------------------------------------------------------------------ */
 /* Connector registration                                             */
 /* ------------------------------------------------------------------ */
 
@@ -120,6 +319,18 @@ static struct devconn_ops nvidia_devconn = {
     .page_size    = 64 * 1024,
     .init         = nvidia_init,
     .find_device  = nvidia_find_device,
+    .mem_alloc    = nvidia_mem_alloc,
+    .mem_free     = nvidia_mem_free,
+    .memcpy_dtod  = nvidia_memcpy_dtod,
+    .memcpy_dtod_async = nvidia_memcpy_dtod_async,
+    .queue_sync   = nvidia_queue_sync,
+#ifdef PHX_NVTX
+    .range_push   = nvidia_range_push,
+    .range_pop    = nvidia_range_pop,
+#else
+    .range_push   = NULL,
+    .range_pop    = NULL,
+#endif
 };
 
 /* The global connector — referenced by core code via extern */

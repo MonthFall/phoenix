@@ -191,7 +191,17 @@ int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_l
     mbuffer->subpage_num = page_size / PAGE_SIZE;
     dev = mbuffer->dev;
     
-    if (dev == NULL || dev->pci_mem_va == NULL) {
+    if (dev == NULL) {
+        phxfs_err("phxfs_map_dev_addr_inner get npu info error\n");
+        ret = -ENOMEM;
+        goto out;
+    }
+    /*
+     * Full mode remapped the whole BAR at probe, so pci_mem_va must be set.
+     * Staging mode remaps this buffer's span lazily below, so a NULL
+     * pci_mem_va (and empty segments) is expected on the first registration.
+     */
+    if (phxfs_map_mode != PHXFS_MAP_MODE_STAGING && dev->pci_mem_va == NULL) {
         phxfs_err("phxfs_map_dev_addr_inner get npu info error\n");
         ret = -ENOMEM;
         goto out;
@@ -279,17 +289,42 @@ int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_l
         goto out;
     }
 
+    /*
+     * Staging mode: the BAR was NOT remapped at probe. Remap exactly the
+     * PHXFS_REMAP_UNIT_SIZE units this buffer's BAR pages fall into, reusing
+     * units an earlier registration already mapped. This must run on *every*
+     * registration, not just the first on the device: the BAR offsets a buffer
+     * is pinned at are picked by the GPU driver per pin, so a second process
+     * (or the same program run with a different allocation history) lands on
+     * different units. Only the touched units get struct pages; the rest of
+     * the BAR keeps pfn_valid == false so user GPU memory stays registerable
+     * by RDMA/peermem.
+     */
+    if (phxfs_map_mode == PHXFS_MAP_MODE_STAGING) {
+        ret = phxfs_staging_ensure_units(dev, dev_page_addrs, nr_dev_pages,
+                                        &mbuffer->unit_starts,
+                                        &mbuffer->nr_units);
+        if (ret) {
+            phxfs_err("phxfs%d: staging remap failed: %d\n", dev->idx, ret);
+            goto out;
+        }
+    }
+
     mbuffer->dev_page_addrs = dev_page_addrs;
     total_pages = mbuffer->host_page_num;
     if (IS_ERR_OR_NULL(mbuffer->ppages)) {
         ret = -ENOMEM;
         goto out;
     }
-    
+
+    /* seg_lock keeps the segment array stable while we walk it: a concurrent
+     * registration on the same device may insert (and krealloc/memmove) it. */
+    mutex_lock(&dev->seg_lock);
     for (i = 0; i < nr_dev_pages; i++) {
         pci_bar_off = dev_page_addrs[i] - mbuffer->dev->paddr;
         cpu_vaddr = (uint64_t)phxfs_bar_offset_to_va(mbuffer->dev, pci_bar_off);
         if (cpu_vaddr == 0) {
+            mutex_unlock(&dev->seg_lock);
             phxfs_err("phxfs_map_dev_addr_inner: bar_offset 0x%llx not in any segment\n",
                    pci_bar_off);
             ret = -EFAULT;
@@ -299,6 +334,7 @@ int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_l
             mbuffer->ppages[i * mbuffer->subpage_num + j] = virt_to_page(cpu_vaddr + j * PAGE_SIZE);
         }
     }
+    mutex_unlock(&dev->seg_lock);
 
 
     for (k = 0; k < total_pages; k++) {
@@ -353,6 +389,13 @@ out:
         kvfree(dev_page_addrs);
         mbuffer->dev_page_addrs = NULL;
     }
+    /* Give back the staging units this attempt referenced. */
+    if (mbuffer->unit_starts != NULL) {
+        phxfs_staging_put_units(dev, mbuffer->unit_starts, mbuffer->nr_units);
+        kvfree(mbuffer->unit_starts);
+        mbuffer->unit_starts = NULL;
+        mbuffer->nr_units = 0;
+    }
 
     return ret;
 }
@@ -373,11 +416,29 @@ int phxfs_map_dev_addr(phxfs_ioctl_map_t *map_param, u64 devaddr, u64 dev_len, u
     }
 }
 
-void phxfs_mbuffer_put(phxfs_mmap_buffer_t mbuffer);
+/*
+ * Release the GPU-side pin of a registration, leaving the buffer descriptor
+ * itself alive. Idempotent: a second call (UNMAP twice, or UNMAP followed by
+ * the VMA teardown path) is a no-op.
+ */
+static void phxfs_mbuffer_unpin(phxfs_mmap_buffer_t mbuffer) {
+    if (mbuffer == NULL || !mbuffer->remap)
+        return;
+    mbuffer->remap = 0;
+    release_gpu_memory(mbuffer->map);   /* put_pages + frees map/gd */
+    mbuffer->map = NULL;
+}
+
+/*
+ * PHXFS_IOCTL_UNMAP: drop the GPU pin now, but keep the buffer (and the BAR
+ * unit references) until the phony-buffer VMA goes away. The BAR pages are
+ * still inserted in that VMA, and unmapping a BAR unit while a page table
+ * still references its pages would block forever in memunmap_pages().
+ */
 void phxfs_map_dev_release(phxfs_ioctl_map_t *map_param, u64 devaddr, u64 dev_len, u64 cpuvaddr, u64 length) {
     phxfs_mmap_buffer_t mbuffer;
     mbuffer = phxfs_check_and_bind_phony_buffer(cpuvaddr, length);
-    phxfs_mbuffer_put(mbuffer);
+    phxfs_mbuffer_unpin(mbuffer);
 }
 
 static void phxfs_mbuffer_free(phxfs_mmap_buffer_t mbuffer) {
@@ -387,18 +448,33 @@ static void phxfs_mbuffer_free(phxfs_mmap_buffer_t mbuffer) {
     spin_lock(&lock);
     hash_del_rcu(&mbuffer->hash_link);
     spin_unlock(&lock);
-    
-    if (mbuffer->remap) {
-        release_gpu_memory(mbuffer->map);
+
+    /* Normally already done by PHXFS_IOCTL_UNMAP; this covers a process that
+     * died without unmapping. */
+    phxfs_mbuffer_unpin(mbuffer);
+
+    /*
+     * Only now, with the VMA (and therefore every page table entry pointing at
+     * the BAR pages) gone, is it safe to give the staging BAR units back: the
+     * release worker can find their pages idle and unmap them.
+     */
+    if (mbuffer->unit_starts != NULL) {
+        phxfs_staging_put_units(mbuffer->dev, mbuffer->unit_starts,
+                                mbuffer->nr_units);
+        kvfree(mbuffer->unit_starts);
+        mbuffer->unit_starts = NULL;
+        mbuffer->nr_units = 0;
     }
 
     if (mbuffer->dev_page_addrs != NULL) {
         kvfree(mbuffer->dev_page_addrs);
+        mbuffer->dev_page_addrs = NULL;
     }
     if (mbuffer->ppages != NULL) {
         kvfree(mbuffer->ppages);
+        mbuffer->ppages = NULL;
     }
-    
+
     mbuffer->dev = NULL;
     mbuffer->vma = NULL;
     mbuffer->base_index = 0;
@@ -524,12 +600,42 @@ int phxfs_add_phony_buffer(struct file *filp, struct vm_area_struct *vma) {
     phxfs_mbuffer->c_vaddr = vma->vm_start;
     phxfs_mbuffer->map_len = buffer_len;
     phxfs_mbuffer->remap = 0;
+    phxfs_mbuffer->unit_starts = NULL;
+    phxfs_mbuffer->nr_units = 0;
 
     return 0;
 
 error:
     return ret;
 }
+
+/*
+ * The phony-buffer VMA owns the buffer descriptor: the ref taken in
+ * phxfs_add_phony_buffer() is the VMA's. ->open covers a VMA split (each half
+ * gets its own reference), ->close drops one. The last drop tears the buffer
+ * down, which is also what reclaims the staging BAR units -- and it runs from
+ * remove_vma(), i.e. after unmap_vmas()/free_pgtables() have already dropped
+ * every page-table reference to those BAR pages. It therefore covers a process
+ * that exits or crashes without calling PHXFS_IOCTL_UNMAP.
+ */
+static void phxfs_vma_open(struct vm_area_struct *vma) {
+    phxfs_mmap_buffer_t mbuffer = (phxfs_mmap_buffer_t)vma->vm_private_data;
+
+    if (mbuffer)
+        phxfs_mbuffer_get_ref(mbuffer);
+}
+
+static void phxfs_vma_close(struct vm_area_struct *vma) {
+    phxfs_mmap_buffer_t mbuffer = (phxfs_mmap_buffer_t)vma->vm_private_data;
+
+    if (mbuffer)
+        phxfs_mbuffer_put(mbuffer);
+}
+
+static const struct vm_operations_struct phxfs_vm_ops = {
+    .open  = phxfs_vma_open,
+    .close = phxfs_vma_close,
+};
 
 int phxfs_mmap(struct file *filp, struct vm_area_struct *vma) {
     int ret;
@@ -553,6 +659,8 @@ int phxfs_mmap(struct file *filp, struct vm_area_struct *vma) {
 
     if (vma->vm_pgoff == 0) {
         ret = phxfs_add_phony_buffer(filp, vma);
+        if (ret == 0)
+            vma->vm_ops = &phxfs_vm_ops;   /* VMA now owns the buffer */
         return ret;
     }
 

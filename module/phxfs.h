@@ -7,8 +7,10 @@
 #include <linux/memremap.h>
 #include <linux/genalloc.h>
 #include <linux/cdev.h>
+#include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/printk.h>
+#include <linux/workqueue.h>
 
 #define MAX_DEV_NUM 16
 #define MAX_GPU_DEVS 64
@@ -34,10 +36,48 @@ extern int phxfs_debug;
 #define PHXFS_REMAP_UNIT_SIZE  ((u64)16 * 1024 * 1024)  /* 16 MiB per remap unit */
 #define PHXFS_RESERVED_SIZE    ((u64)128 * 1024 * 1024)  /* 128 MiB reserved at head/tail */
 
+/*
+ * BAR mapping mode (module param phxfs_map_mode).
+ *
+ *   FULL    : remap the whole GPU BAR at probe. Any registered user GPU
+ *             buffer gets a struct page and DMAs directly (SSD -> user GPU).
+ *             This gives every BAR page a struct page (pfn_valid == true),
+ *             which is what prevents nvidia_p2p_dma_map_pages() (RDMA/peermem)
+ *             from mapping the same GPU afterwards.
+ *   STAGING : do NOT remap at probe. Remap, on demand at each registration,
+ *             only the PHXFS_REMAP_UNIT_SIZE units of BAR actually covered by
+ *             the registered buffer -- in practice Phoenix's own staging pool.
+ *             Units already remapped by an earlier registration are reused.
+ *             The rest of the BAR keeps pfn_valid == false, so user GPU memory
+ *             stays registerable by RDMA/peermem. Data is DMA'd into the
+ *             staging pool and copied D2D to the user buffer by libphoenix.
+ *
+ *             On-demand (rather than once-per-device) remapping is required
+ *             because the BAR aperture offsets a buffer is pinned at are
+ *             chosen by the GPU driver per pin: two processes, or two runs
+ *             with a different allocation history (e.g. under a profiler),
+ *             legitimately land on different BAR units.
+ */
+#define PHXFS_MAP_MODE_FULL     0
+#define PHXFS_MAP_MODE_STAGING  1
+/*
+ * Compile-time default map mode, set by the build (CMake PHXFS_MAP_MODE).
+ * STAGING is the default; FULL must be opted into (cmake -DPHXFS_MAP_MODE=full
+ * or, at load time, insmod phoenixfs.ko phxfs_map_mode=0).
+ */
+#ifndef PHXFS_MAP_MODE_DEFAULT
+#define PHXFS_MAP_MODE_DEFAULT  PHXFS_MAP_MODE_STAGING
+#endif
+extern int phxfs_map_mode;
+
 struct phxfs_bar_segment {
 	u64 phys_start;    /* physical start address of this segment */
 	u64 size;          /* segment size (multiple of PHXFS_REMAP_UNIT_SIZE) */
 	void *va;          /* virtual address from devm_memremap_pages */
+	int refcount;      /* live registrations covering this unit (staging mode).
+			    * 0 means "reclaimable": the release worker may unmap
+			    * it, and until it does the unit stays valid and is
+			    * re-adopted by the next registration that needs it. */
 	struct pci_p2pdma_pagemap *p2p_pgmap;
 };
 
@@ -61,8 +101,13 @@ struct phxfs_dev {
     struct pci_p2pdma_pagemap *p2p_pgmap; /* legacy single-segment pgmap (kept for compat) */
     void __iomem *pci_mem_va; /* legacy single-segment VA (kept for compat) */
     bool remap;
-    struct phxfs_bar_segment *segments; /* dynamically allocated segment array */
+    struct phxfs_bar_segment *segments; /* dynamically allocated segment array,
+                                         * kept sorted by phys_start */
     int num_segments;    /* number of successfully mapped segments */
+    int seg_capacity;    /* allocated entries in segments[] (>= num_segments) */
+    struct mutex seg_lock; /* guards segments/num_segments/seg_capacity */
+    struct delayed_work seg_release_work; /* unmaps refcount==0 units */
+    int seg_release_tries; /* remaining retries for the release worker */
 };
 
 struct phxfs_ctrl {
@@ -135,5 +180,30 @@ typedef union phxfs_ioctl_para_s phxfs_ioctl_para_t;
 #define PHXFS_IOCTL_UNMAP _IOW(PHXFS_IOCTL, 2, struct phxfs_ioctl_map_s)
 
 void phxfs_map_dev_release(phxfs_ioctl_map_t *map_param, u64 devaddr, u64 dev_len, u64 cpuvaddr, u64 length);
+
+/*
+ * Staging mode: make sure every BAR page in phys[0..n) has a ZONE_DEVICE
+ * mapping, remapping the PHXFS_REMAP_UNIT_SIZE units that are not covered yet
+ * and reusing (re-adopting) those that are. Takes a reference on every unit the
+ * registration covers and hands the unit list to the caller, which must pass it
+ * back to phxfs_staging_put_units() when the registration goes away.
+ * Takes dev->seg_lock. Returns 0, or a negative errno (with no references and
+ * no unit list left behind; units created before the failure stay mapped and
+ * reusable).
+ */
+int phxfs_staging_ensure_units(struct phxfs_dev *dev, const u64 *phys,
+			       unsigned long n, u64 **out_units,
+			       unsigned int *out_nr_units);
+
+/*
+ * Drop the references taken by phxfs_staging_ensure_units(). Units that reach
+ * zero references are handed to the release worker, which unmaps them once
+ * their pages are idle. Does not free `units` itself.
+ */
+void phxfs_staging_put_units(struct phxfs_dev *dev, const u64 *units,
+			     unsigned int nr_units);
+
+/* Stop the release worker (module unload / device teardown). */
+void phxfs_staging_release_cancel(struct phxfs_dev *dev);
 
 #endif

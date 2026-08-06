@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <fcntl.h>
+#include <fstream>
 #include <pthread.h>
 #include <unistd.h>
 #include <string>
@@ -27,6 +28,24 @@ static std::vector<std::string> phxfs_dev_path = {
 static std::vector<bool> phxfs_initialized(PHXFS_MAX_DEVICES, false);
 
 /*
+ * Read the kernel BAR mapping mode for a phxfs device from sysfs. Absent node
+ * (older module without the attribute) defaults to FULL — the historical
+ * direct-DMA behaviour.
+ */
+static int phxfs_read_map_mode(int device_id) {
+    std::string path = "/sys/class/phxfs-generic/phxfs_dev"
+                       + std::to_string(device_id) + "/map_mode";
+    std::ifstream ifs(path);
+    int mode = PHX_MAP_MODE_FULL;
+    if (ifs.is_open()) {
+        int m;
+        if (ifs >> m)
+            mode = m;
+    }
+    return mode;
+}
+
+/*
  * Serialises open()/close() across devices so concurrent phxfs_open() from
  * multiple threads (e.g. one worker per GPU) and open-vs-close are safe.
  * reg/dereg/batch synchronise per-device on mbuffer[].lock instead.
@@ -45,6 +64,10 @@ static void phxfs_dev_ctor(void) {
         mbuffer[i].active_ops = 0;
         mbuffer[i].head       = NULL;
         mbuffer[i].last_hit   = NULL;
+        mbuffer[i].map_mode     = PHX_MAP_MODE_FULL;
+        mbuffer[i].staging_dptr = NULL;
+        mbuffer[i].staging_host = NULL;
+        mbuffer[i].staging_size = 0;
     }
     /* Honour the connector init contract once at load. */
     devconn_init();
@@ -86,6 +109,7 @@ void dev_put(phxfs_mmap_buffer_t *pb) {
  */
 static void __phxfs_teardown(phxfs_mmap_buffer_t *pb) {
     free_phxfs_p2p_map(pb);              /* UNMAP + munmap each registration */
+    phx_staging_teardown(pb);            /* free the staging pool (staging mode) */
     if (pb->bdev_fd >= 0)                /* fd 0 is a valid fd and must be closed too */
         close(pb->bdev_fd);
     pb->bdev_fd  = -1;
@@ -163,6 +187,10 @@ static int __phxfs_open(const char *dev_path, phxfs_mmap_buffer_t *mbuffer,
     mbuffer->device_id = device_id;
     mbuffer->closing = false;
     mbuffer->active_ops = 0;
+    mbuffer->map_mode = phxfs_read_map_mode(device_id);
+    mbuffer->staging_dptr = NULL;
+    mbuffer->staging_host = NULL;
+    mbuffer->staging_size = 0;
     mbuffer->init_stat = true;
     return 0;
 }
@@ -177,8 +205,11 @@ int phxfs_open(int deviceID) {
         return -1;
     phxfs_mmap_buffer_t *pb = &mbuffer[deviceID];
 
+    PHX_RANGE("phx.open");
+
     pthread_mutex_lock(&g_open_lock);
     int ret = 0;
+    bool fresh_open = false;
     if (pb->init_stat) {
         pb->open_count++;              /* already open: just add a client ref */
     } else if (pb->closing) {
@@ -191,9 +222,26 @@ int phxfs_open(int deviceID) {
         if (ret == 0) {
             pb->open_count = 1;
             phxfs_initialized[deviceID] = true;
+            fresh_open = true;
         }
     }
     pthread_mutex_unlock(&g_open_lock);
+
+    /*
+     * Staging mode: allocate + register Phoenix's internal staging pool once,
+     * on the first open, outside g_open_lock (device memory allocation is
+     * heavy and must not block open/close of other devices). If it fails the
+     * device is unusable in staging mode, so roll the open back.
+     */
+    if (ret == 0 && fresh_open && pb->map_mode == PHX_MAP_MODE_STAGING) {
+        int src = phx_staging_setup(deviceID);
+        if (src != 0) {
+            fprintf(stderr, "phxfs_open: staging setup failed on dev %d: %d\n",
+                    deviceID, src);
+            phxfs_close(deviceID);
+            return src;
+        }
+    }
     return ret;
 }
 

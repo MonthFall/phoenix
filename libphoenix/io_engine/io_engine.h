@@ -71,13 +71,17 @@ extern const struct phxfs_io_engine phxfs_io_engine_uring;
 /* ------------------------------------------------------------------ *
  * Batch I/O thread pool
  *
- * A batch of already-resolved requests is fanned out (round-robin) across a
- * small, fixed set of worker threads, each running the active engine's
- * submit_batch on its own thread_local ring. Multiple independent rings can
- * submit/reap concurrently, which is what lets one top-level call reach an
- * array's aggregate bandwidth (a single ring saturates at most one device);
- * it also lets a single call cross the Python GIL once instead of the caller
- * managing threads.
+ * A batch of already-resolved requests is handed to a small, fixed set of
+ * worker threads that claim contiguous chunks of it, each running the active
+ * engine's submit_batch on its own thread_local ring. Multiple independent
+ * rings can submit/reap concurrently, which is what lets one top-level call
+ * reach an array's aggregate bandwidth (a single ring saturates at most one
+ * device); it also lets a single call cross the Python GIL once instead of the
+ * caller managing threads.
+ *
+ * Workers pull from all live jobs round-robin and never synchronise on a job
+ * boundary, so back-to-back batches keep the device queue full and a small
+ * batch is not stuck behind a large one. See io_pool.cpp for the details.
  *
  * There is deliberately no NUMA-based routing here: the actual P2P transfer
  * is device-to-device DMA (NVMe controller -> PCIe -> GPU BAR) that never

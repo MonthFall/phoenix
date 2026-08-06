@@ -13,9 +13,35 @@ phxfs: configure
 	$(MAKE) -C $(KERNEL_SRC) M=@module_output@ modules
 configure:
 	@ @module_root@/configure $(KVER) @module_root@
+# Optional MAP_MODE=0|1 overrides the baked-in default BAR map mode for this load
+# (e.g. `make insmod MAP_MODE=0`). Empty -> load the cmake-configured default.
 insmod:
-	sudo insmod phoenixfs.ko
+	sudo insmod phoenixfs.ko $(if $(strip $(MAP_MODE)),phxfs_map_mode=$(strip $(MAP_MODE)),)
+# Named targets so the mode is TAB-completable (make completes target names,
+# not VAR=val assignments).
+insmod-staging:
+	sudo insmod phoenixfs.ko phxfs_map_mode=1
+insmod-full:
+	sudo insmod phoenixfs.ko phxfs_map_mode=0
 rmmod:
 	sudo rmmod phoenixfs
+install:
+	@if [ ! -f phoenixfs.ko ]; then \
+		echo ">> phoenixfs.ko not found (build first, or module disabled); skipping"; \
+		exit 0; \
+	fi; \
+	KREL=$$(uname -r); DEST=/lib/modules/$$KREL/extra; \
+	echo ">> installing phoenixfs.ko -> $$DEST"; \
+	if mkdir -p "$$DEST" 2>/dev/null && cp phoenixfs.ko "$$DEST/" 2>/dev/null; then \
+		if depmod -a 2>/dev/null; then \
+			echo ">> installed; load with: sudo modprobe phoenixfs"; \
+		else \
+			echo ">> copied, but 'depmod -a' failed (run: sudo depmod -a)"; \
+		fi; \
+	else \
+		echo ">> kernel module install failed (need root / writable $$DEST)."; \
+		echo ">> load in place instead: sudo insmod $(CURDIR)/phoenixfs.ko"; \
+		exit 1; \
+	fi
 clean:
 	rm -fr *.o *.ko *.mod* .*.cmd .*.d

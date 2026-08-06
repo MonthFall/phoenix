@@ -2,9 +2,9 @@
  * Batch I/O thread pool.
  *
  * A fixed set of PHXFS_POOL_THREADS worker threads, each running the active
- * engine's submit_batch on its own thread_local ring. A batch is split
- * round-robin across the workers so N rings issue I/O concurrently and reach
- * the storage array's aggregate bandwidth ceiling, while the caller makes one
+ * engine's submit_batch on its own thread_local ring. Workers pull chunks of
+ * work from the live jobs, so N rings issue I/O concurrently and reach the
+ * storage array's aggregate bandwidth ceiling, while the caller makes one
  * (blocking or async) call and crosses the Python GIL once.
  *
  * Workers are NOT pinned to any NUMA node: the P2P transfer this pool exists
@@ -12,19 +12,25 @@
  * worker runs on has no effect on that data path (see io_engine.h). The only
  * job of this pool is fanning a batch out across enough independent rings.
  *
- * Scheduling model (bounded FIFO queue):
- *   - Submitted jobs queue up (bounded capacity) and run one at a time, each
- *     using the full worker set — so every job still gets the pool's full
- *     concurrency. submit() enqueues and returns immediately; it only fails
- *     with EBUSY when the queue itself is full. This supports pipelining:
- *     a caller can submit several batches, overlap compute, then wait each
- *     handle, without a single global "one batch in flight" stall.
- *   - Each job carries its own result state (failed/err/done); results are
- *     read by that job's wait(), decoupled from when the job leaves the
- *     queue.
- *   - A worker participates in the current job iff its lane < that job's
- *     stride; only participating workers touch the request array and
- *     decrement pending.
+ * Scheduling model (shared work queue, no per-job barrier):
+ *   - Every submitted job joins a bounded FIFO of *live* jobs. A worker claims
+ *     a chunk of a job's ops (ceil(n / workers), capped at
+ *     PHXFS_POOL_CHUNK_MAX), runs that chunk to completion on
+ *     its own ring, accounts the results, and claims again.
+ *   - There is no barrier between jobs: a worker that exhausts one job's ops
+ *     immediately claims from the next, so the device queue does not drain at
+ *     a job boundary. (The previous model ran one job at a time across all
+ *     workers and waited for every worker before promoting the next job, which
+ *     emptied the device queue once per job — visible as a PCIe bubble per
+ *     staging group.)
+ *   - Claiming is round-robin over the live jobs, so a small batch submitted
+ *     behind a huge one (e.g. another GPU's worker) makes progress right away
+ *     instead of waiting behind it (no head-of-line blocking).
+ *   - A chunk is a contiguous index range, so the worker hands the engine a
+ *     slice of the caller's array directly — no copy — and the offsets it
+ *     issues are sequential, which suits merging in the block layer.
+ *   - Each job carries its own result state (claimed/completed/failed/err);
+ *     results are read by that job's wait(), decoupled from scheduling.
  */
 #include <cerrno>
 #include <cstdio>
@@ -40,21 +46,32 @@
  * work. */
 #define PHXFS_POOL_QUEUE_CAP 16
 
+/*
+ * Upper bound on the ops one worker claims per round. Sized so a worker keeps
+ * a deep ring (hundreds of concurrent ops) while still returning often enough
+ * to pick up another job's work. The per-job claim size is derived from this
+ * and the job size (see job_enqueue) so that a small batch is still spread
+ * across every worker instead of landing on one ring.
+ */
+#define PHXFS_POOL_CHUNK_MAX 256
+
 /* One unit of work. Independent, heap- or stack-allocated by the submitter; its
  * result fields are filled by the workers and read by the matching wait(). */
 struct pool_job {
     struct phxfs_io_op_req *reqs;
     int              n;
     enum phxfs_io_op op;
+    int              chunk;    /* ops per claim (fixed for the job) */
+    int              claimed;  /* ops handed out to workers */
+    int              completed;/* ops accounted (== n -> done) */
     int              failed;   /* OUT: accumulated failure count (under mtx) */
     int              err;      /* OUT: first engine-level (<0) error, else 0 */
-    bool             done;     /* set once all participating workers finished */
-    struct pool_job *next;     /* FIFO link (waiting queue) */
+    bool             done;     /* set once every op has been accounted */
+    struct pool_job *next;     /* FIFO link */
 };
 
 struct worker {
     pthread_t tid;
-    int       lane;            /* 0..PHXFS_POOL_THREADS-1 */
 };
 
 struct pool_state {
@@ -62,16 +79,13 @@ struct pool_state {
     int             nthreads;
 
     pthread_mutex_t mtx;
-    pthread_cond_t  work_cv;   /* new current job / stop -> workers */
+    pthread_cond_t  work_cv;   /* new work / stop -> workers */
     pthread_cond_t  done_cv;   /* a job completed -> waiters */
     pthread_cond_t  free_cv;   /* a queue slot freed -> blocked submitters */
 
-    struct pool_job *q_head, *q_tail;  /* waiting jobs (excludes cur) */
-    struct pool_job *cur;              /* job the workers are running now */
-    long             cur_gen;          /* bumped whenever cur changes */
-    int              stride;           /* participating workers for cur */
-    int              pending;          /* participating workers still running */
-    int              inflight;         /* jobs in the system (waiting + cur) */
+    struct pool_job *q_head, *q_tail;  /* live jobs, in submit order */
+    struct pool_job *rr;              /* round-robin claim cursor */
+    int              inflight;         /* live jobs (queued + running) */
     bool             stop;
 };
 
@@ -79,116 +93,119 @@ static struct pool_state g_pool;
 static bool              g_pool_ready = false;
 static pthread_once_t    g_once = PTHREAD_ONCE_INIT;
 
-/* Run this worker's stripe of `job`: reqs[lane], reqs[lane+stride], ...
- * Accumulates this lane's failure count / first engine error into out params. */
-static void worker_run_stripe(struct pool_job *job, int lane, int stride,
-                              int *out_failed, int *out_err) {
+/*
+ * Run reqs[base .. base+cnt) of `job` on this thread's ring. The range is
+ * contiguous, so the engine writes straight into the caller's array.
+ */
+static void worker_run_chunk(struct pool_job *job, int base, int cnt,
+                             int *out_failed, int *out_err) {
     const struct phxfs_io_engine *eng = phxfs_io_engine_get();
+    struct phxfs_io_op_req *ops = &job->reqs[base];
 
-    enum { CHUNK = 1024 };
-    struct phxfs_io_op_req local[CHUNK];
-    int back_idx[CHUNK];
-
-    int failed = 0, err = 0;
-    int base = lane;
-    while (base < job->n) {
-        int cnt = 0;
-        for (int i = base; i < job->n && cnt < CHUNK; i += stride) {
-            local[cnt] = job->reqs[i];
-            back_idx[cnt] = i;
-            cnt++;
-        }
-        if (cnt == 0)
-            break;
-
-        int rc = eng->submit_batch(local, cnt, job->op);
-        if (rc < 0) {
-            /* Engine-level failure: record the first one, mark this lane's
-             * requests, but do NOT fold into a positive failure count. */
-            if (err == 0)
-                err = rc;
-            for (int k = 0; k < cnt; k++)
-                job->reqs[back_idx[k]].result = rc;
-            failed += cnt;
-        } else {
-            for (int k = 0; k < cnt; k++) {
-                job->reqs[back_idx[k]].result = local[k].result;
-                if (local[k].result != (ssize_t)local[k].nbytes)
-                    failed++;
-            }
-        }
-        base += stride * CHUNK;
-    }
-    *out_failed = failed;
-    *out_err = err;
-}
-
-/* Promote the queue head to `cur` and wake its workers. Caller holds mtx.
- * If the queue is empty, cur becomes NULL; under stop that also wakes idle
- * workers so they can exit. */
-static void start_next_locked(struct pool_state *p) {
-    struct pool_job *job = p->q_head;
-    if (!job) {
-        p->cur = NULL;
-        if (p->stop)
-            pthread_cond_broadcast(&p->work_cv);
+    int rc = eng->submit_batch(ops, cnt, job->op);
+    if (rc < 0) {
+        /* Engine-level failure: record it and mark this chunk's requests, but
+         * do NOT fold into a positive failure count. */
+        for (int k = 0; k < cnt; k++)
+            ops[k].result = rc;
+        *out_failed = cnt;
+        *out_err = rc;
         return;
     }
-    p->q_head = job->next;
-    if (!p->q_head)
-        p->q_tail = NULL;
+    *out_failed = rc;   /* engine contract: >=0 is the failed-request count */
+    *out_err = 0;
+}
+
+/*
+ * Claim up to this job's chunk size from some live job, round-robin across
+ * jobs. Returns the job, with the claimed range written to base/cnt, or NULL
+ * if no live job has unclaimed ops. Caller holds mtx.
+ */
+static struct pool_job *claim_locked(struct pool_state *p, int *base, int *cnt) {
+    struct pool_job *start = p->rr ? p->rr : p->q_head;
+    struct pool_job *j = start;
+
+    while (j) {
+        if (j->claimed < j->n) {
+            int take = j->n - j->claimed;
+            if (take > j->chunk)
+                take = j->chunk;
+            *base = j->claimed;
+            *cnt  = take;
+            j->claimed += take;
+            /* Next claim starts at the following job -> round robin. */
+            p->rr = j->next ? j->next : p->q_head;
+            return j;
+        }
+        j = j->next ? j->next : p->q_head;   /* wrap */
+        if (j == start)
+            break;                            /* full circle: nothing to claim */
+    }
+    return NULL;
+}
+
+/* Unlink a completed job, keeping q_tail and the round-robin cursor valid.
+ * Caller holds mtx. */
+static void job_remove_locked(struct pool_state *p, struct pool_job *job) {
+    struct pool_job **pp = &p->q_head;
+    struct pool_job  *prev = NULL;
+
+    while (*pp && *pp != job) {
+        prev = *pp;
+        pp = &(*pp)->next;
+    }
+    if (!*pp)
+        return;                     /* not linked (defensive) */
+    *pp = job->next;
+    if (p->q_tail == job)
+        p->q_tail = prev;
+    if (p->rr == job)
+        p->rr = job->next ? job->next : p->q_head;
     job->next = NULL;
-
-    int stride = p->nthreads;
-    if (stride > job->n)
-        stride = job->n;
-    if (stride < 1)
-        stride = 1;
-
-    p->cur     = job;
-    p->cur_gen++;
-    p->stride  = stride;
-    p->pending = stride;
-    pthread_cond_broadcast(&p->work_cv);
 }
 
 static void *worker_main(void *arg) {
-    struct worker *w = (struct worker *)arg;
     struct pool_state *p = &g_pool;
+    (void)arg;
 
-    long seen = 0;
     pthread_mutex_lock(&p->mtx);
     for (;;) {
-        while (!(p->stop && p->cur == NULL) &&
-               !(p->cur_gen != seen && p->cur != NULL && w->lane < p->stride))
+        int base = 0, cnt = 0;
+        struct pool_job *job = claim_locked(p, &base, &cnt);
+
+        while (!job) {
+            /* Exit only once every live job has been fully accounted, so no
+             * waiter is ever left hanging by a shutdown. */
+            if (p->stop && p->inflight == 0) {
+                pthread_mutex_unlock(&p->mtx);
+                return NULL;
+            }
             pthread_cond_wait(&p->work_cv, &p->mtx);
-
-        /* Exit only once the queue is fully drained: while a job is current we
-         * run it even under stop, so `pending` is always decremented and no
-         * waiter is left hanging. */
-        if (p->stop && p->cur == NULL) {
-            pthread_mutex_unlock(&p->mtx);
-            return NULL;
+            job = claim_locked(p, &base, &cnt);
         }
-
-        seen = p->cur_gen;
-        struct pool_job *job = p->cur;
-        int lane = w->lane, stride = p->stride;
         pthread_mutex_unlock(&p->mtx);
 
+        /*
+         * `job` stays valid here without the lock: done (and therefore the
+         * waiter's return, which may free stack-allocated jobs) can only be
+         * set once completed == n, and this chunk is counted below.
+         */
         int lfailed = 0, lerr = 0;
-        worker_run_stripe(job, lane, stride, &lfailed, &lerr);
+        worker_run_chunk(job, base, cnt, &lfailed, &lerr);
 
         pthread_mutex_lock(&p->mtx);
         job->failed += lfailed;
         if (job->err == 0 && lerr < 0)
             job->err = lerr;
-        if (--p->pending == 0) {
+        job->completed += cnt;
+        if (job->completed == job->n) {
             job->done = true;
+            job_remove_locked(p, job);
+            p->inflight--;
             pthread_cond_broadcast(&p->done_cv);   /* wake this job's waiter */
-            p->inflight--;                          /* job leaves the system */
-            pthread_cond_signal(&p->free_cv);       /* a queue slot freed */
-            start_next_locked(p);                   /* run next, or cur=NULL */
+            pthread_cond_signal(&p->free_cv);      /* a queue slot freed */
+            if (p->stop && p->inflight == 0)
+                pthread_cond_broadcast(&p->work_cv);  /* release idle workers */
         }
     }
 }
@@ -202,8 +219,8 @@ static void pool_atfork_child(void) {
     g_pool_ready = false;
     g_once = PTHREAD_ONCE_INIT;
     g_pool.nthreads = 0;
-    g_pool.cur = NULL;
     g_pool.q_head = g_pool.q_tail = NULL;
+    g_pool.rr = NULL;
     g_pool.inflight = 0;
     g_pool.stop = false;
 }
@@ -215,17 +232,12 @@ static void pool_init(void) {
     pthread_cond_init(&p->done_cv, NULL);
     pthread_cond_init(&p->free_cv, NULL);
     p->q_head = p->q_tail = NULL;
-    p->cur = NULL;
-    p->cur_gen = 0;
-    p->stride = 0;
-    p->pending = 0;
+    p->rr = NULL;
     p->inflight = 0;
     p->stop = false;
     p->nthreads = PHXFS_POOL_THREADS;
     for (int t = 0; t < p->nthreads; t++) {
-        p->workers[t].lane = t;
-        if (pthread_create(&p->workers[t].tid, NULL, worker_main,
-                           &p->workers[t]) != 0) {
+        if (pthread_create(&p->workers[t].tid, NULL, worker_main, NULL) != 0) {
             p->nthreads = t;
             break;
         }
@@ -276,14 +288,29 @@ static int job_enqueue(struct pool_state *p, struct pool_job *job, bool blocking
         }
     }
     job->done = false;
+    job->claimed = 0;
+    job->completed = 0;
     job->failed = 0;
     job->err = 0;
     job->next = NULL;
+    /*
+     * Claim size: spread the job over every worker (so a small batch still
+     * uses all rings, as the previous striped model did), capped so a huge
+     * batch is handed out in bounded pieces and workers can interleave jobs.
+     * Fixed for the job's lifetime, so the number of engine calls is
+     * ceil(n / chunk) — no shrinking tail chunks.
+     */
+    job->chunk = (job->n + p->nthreads - 1) / p->nthreads;
+    if (job->chunk > PHXFS_POOL_CHUNK_MAX)
+        job->chunk = PHXFS_POOL_CHUNK_MAX;
+    if (job->chunk < 1)
+        job->chunk = 1;
     if (p->q_tail) p->q_tail->next = job; else p->q_head = job;
     p->q_tail = job;
+    if (!p->rr)
+        p->rr = job;
     p->inflight++;
-    if (p->cur == NULL)             /* idle: promote this job to current */
-        start_next_locked(p);
+    pthread_cond_broadcast(&p->work_cv);   /* several workers may take chunks */
     pthread_mutex_unlock(&p->mtx);
     return 0;
 }

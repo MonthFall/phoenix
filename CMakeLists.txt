@@ -30,6 +30,7 @@ endif ()
 find_package(PkgConfig REQUIRED)
 
 set (no_liburing false CACHE BOOL "Do not use liburing (io_uring async I/O)")
+set (phx_nvtx true CACHE BOOL "Emit NVTX ranges from libphoenix (for nsys)")
 
 if (NOT no_liburing)
     pkg_check_modules(LIBURING liburing)
@@ -52,6 +53,10 @@ set (KERNEL "/lib/modules/${CMAKE_SYSTEM_VERSION}/build" CACHE PATH "Path to ker
 set (nvidia_archs "90" CACHE STRING "NVIDIA compute architectures")
 set (no_module false CACHE BOOL "Do not build kernel module")
 set (BUILD_SHARED_LIBS true CACHE BOOL "Build shared library, set to false for static")
+# Default BAR mapping mode baked into phoenixfs.ko: "staging" (default) or
+# "full". Still overridable at load time via the phxfs_map_mode module param.
+set (PHXFS_MAP_MODE "staging" CACHE STRING "default BAR mapping mode: full or staging")
+set_property (CACHE PHXFS_MAP_MODE PROPERTY STRINGS full staging)
 
 if (no_smartio)
     set (no_smartio_samples true)
@@ -146,10 +151,17 @@ set (module_root "${PROJECT_SOURCE_DIR}/module")
 set (module_output "${CMAKE_BINARY_DIR}/module")
 # for Makefile.in, do not delete
 if (driver_include)
-    set (module_ccflags "-I${driver_include} -D${VENDOR_DEFINE}")
+	set (module_ccflags "-I${driver_include} -D${VENDOR_DEFINE}")
 else ()
-    set (module_ccflags "-D${VENDOR_DEFINE}")
+	set (module_ccflags "-D${VENDOR_DEFINE}")
 endif ()
+# Bake the default BAR mapping mode into phoenixfs.ko.
+if (PHXFS_MAP_MODE STREQUAL "full")
+	set (PHXFS_MAP_MODE_DEFAULT 0)
+else ()
+	set (PHXFS_MAP_MODE_DEFAULT 1)
+endif ()
+set (module_ccflags "${module_ccflags} -DPHXFS_MAP_MODE_DEFAULT=${PHXFS_MAP_MODE_DEFAULT}")
 configure_file ("${module_root}/Makefile.in" "${module_output}/Makefile" @ONLY)
 message (STATUS "Configuring module build in ${module_output}")
 
@@ -170,9 +182,24 @@ add_custom_target(
 
 add_custom_target(
     insmod
-    COMMAND sudo make insmod
+    # Optional override: `make insmod MAP_MODE=0|1` forces the BAR map mode for
+    # this load, overriding the mode baked in at cmake time (PHXFS_MAP_MODE).
+    COMMAND sudo make insmod MAP_MODE=$(MAP_MODE)
     WORKING_DIRECTORY ${module_output}
     COMMENT "Inserting kernel module"
+)
+# Named variants so the mode is TAB-completable at the top level too.
+add_custom_target(
+    insmod-staging
+    COMMAND sudo make insmod-staging
+    WORKING_DIRECTORY ${module_output}
+    COMMENT "Inserting kernel module (STAGING mode)"
+)
+add_custom_target(
+    insmod-full
+    COMMAND sudo make insmod-full
+    WORKING_DIRECTORY ${module_output}
+    COMMENT "Inserting kernel module (FULL mode)"
 )
 
 add_custom_target(
@@ -213,6 +240,12 @@ target_include_directories(libphoenix PRIVATE "${libphoenix_root}")
 target_link_libraries(libphoenix Threads::Threads)
 if (PHXFS_VENDOR STREQUAL "NVIDIA")
     target_link_libraries(libphoenix CUDA::cudart)
+    # NVTX ranges (phx.batch.*, phx.staging.*) for nsys. NVTX v3 is
+    # header-only, so this adds no link dependency; disable with
+    # cmake -Dphx_nvtx=false.
+    if (phx_nvtx)
+        target_compile_definitions(libphoenix PRIVATE PHX_NVTX=1)
+    endif ()
 endif ()
 
 # Link liburing for the io_uring batch engine when available.
@@ -224,6 +257,14 @@ endif ()
 # Set install locations
 install (FILES ${libphoenix_include} DESTINATION "include")
 install (TARGETS libphoenix DESTINATION "lib")
+# Also install the phoenixfs kernel module into the running kernel's module
+# tree (/lib/modules/$(uname -r)/extra) + depmod. A failure here (e.g. missing
+# root or a mismatched kernel tree) only warns — it must not abort the library
+# install above. Run `sudo make install` for a system-path install.
+install (CODE "execute_process (COMMAND make -C ${module_output} install RESULT_VARIABLE _phx_mod_install_res)
+	if (NOT _phx_mod_install_res EQUAL 0)
+		message (WARNING \"phoenixfs.ko was not installed (see output above). libphoenix was still installed.\")
+	endif ()")
 
 
 # Make target depend on pthreads

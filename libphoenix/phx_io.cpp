@@ -19,6 +19,23 @@
 /* ------------------------------------------------------------------ */
 
 /*
+ * True if the batch/request references a GPU device operating in staging
+ * mode. The mapping mode is a global kernel module parameter, so all phxfs
+ * devices share it; checking the first referenced device is sufficient.
+ */
+static bool device_is_staging(int device_id) {
+    return device_id >= 0 && device_id < g_device_count &&
+           mbuffer[device_id].map_mode == PHX_MAP_MODE_STAGING;
+}
+
+static bool batch_uses_staging(phxfs_io_req_t *reqs, int n) {
+    for (int i = 0; i < n; i++)
+        if (device_is_staging(reqs[i].device_id))
+            return true;
+    return false;
+}
+
+/*
  * Resolve a plain CPU (host) buffer address: buf + buf_offset, with the
  * pointer/length arithmetic checked against address-space overflow. Shared
  * by the single-request read/write path and the batch prepare path so a
@@ -88,6 +105,14 @@ ssize_t phxfs_read(int fd, int device_id, void *buf, off_t buf_offset, ssize_t n
         return xfer(fd, host, nbyte, f_offset, /*is_write=*/false);
     }
 
+    if (device_is_staging(device_id)) {
+        phxfs_io_req_t r{};
+        r.fd = fd; r.device_id = device_id; r.buf = buf;
+        r.buf_offset = buf_offset; r.nbytes = (size_t)nbyte; r.f_offset = f_offset;
+        phx_staging_batch(&r, 1, /*is_write=*/0);
+        return r.result;
+    }
+
     phxfs_mmap_buffer_t *pb = dev_get(device_id);
     if (!pb)
         return -1;
@@ -114,6 +139,14 @@ ssize_t phxfs_write(int fd, int device_id, void *buf, off_t buf_offset, ssize_t 
         if (r != 0)
             return r;
         return xfer(fd, host, nbyte, f_offset, /*is_write=*/true);
+    }
+
+    if (device_is_staging(device_id)) {
+        phxfs_io_req_t r{};
+        r.fd = fd; r.device_id = device_id; r.buf = buf;
+        r.buf_offset = buf_offset; r.nbytes = (size_t)nbyte; r.f_offset = f_offset;
+        phx_staging_batch(&r, 1, /*is_write=*/1);
+        return r.result;
     }
 
     phxfs_mmap_buffer_t *pb = dev_get(device_id);
@@ -291,13 +324,22 @@ static int phxfs_batch(phxfs_io_req_t *reqs, int n, enum phxfs_io_op op) {
     if (n <= 0)
         return 0;
 
+    PHX_RANGE(op == PHXFS_IO_WRITE ? "phx.batch.write" : "phx.batch.read");
+
+    /* Staging mode: the whole batch goes through the staging pool + D2D. The
+     * mode is global, so a single staging device implies all are staging. */
+    if (batch_uses_staging(reqs, n))
+        return phx_staging_batch(reqs, n, op == PHXFS_IO_WRITE);
+
     struct batch_ctx bc;
     if (phxfs_batch_prepare(reqs, n, &bc) < 0)
         return -ENOMEM;
 
     int ret = 0;
     if (bc.cnt > 0) {
+        phx_range_push("phx.io.pool_run");
         ret = phxfs_pool_run(bc.ops, bc.cnt, op);
+        phx_range_pop();
         for (int k = 0; k < bc.cnt; k++)
             reqs[bc.map[k]].result = bc.ops[k].result;
     }
@@ -327,10 +369,15 @@ struct phxfs_batch {
     struct batch_ctx         bc;       /* resolved ops + held device/mapping refs */
     phxfs_io_req_t          *reqs;     /* user array, for result copy-back */
     bool                     joined;   /* wait()/destroy() already consumed this handle */
+    bool                     staging;  /* staging-mode batch: run at wait() time */
+    int                      staging_n;
+    int                      staging_is_write;
 };
 
 static phxfs_batch_t *phxfs_batch_submit(phxfs_io_req_t *reqs, int n,
                                          enum phxfs_io_op op) {
+    PHX_RANGE(op == PHXFS_IO_WRITE ? "phx.batch.submit.write"
+                : "phx.batch.submit.read");
     phxfs_batch_t *h = (phxfs_batch_t *)calloc(1, sizeof(*h));
     if (!h)
         return NULL;
@@ -339,6 +386,16 @@ static phxfs_batch_t *phxfs_batch_submit(phxfs_io_req_t *reqs, int n,
 
     if (n <= 0)
         return h;   /* empty batch: wait() returns 0, matching sync semantics */
+
+    /* Staging mode: defer the whole transfer (SSD->staging->D2D->user) to
+     * wait(). The internal read pipeline still overlaps NVMe DMA with the D2D
+     * copy; cross-call compute overlap is not offered on this path. */
+    if (batch_uses_staging(reqs, n)) {
+        h->staging = true;
+        h->staging_n = n;
+        h->staging_is_write = (op == PHXFS_IO_WRITE);
+        return h;
+    }
 
     if (phxfs_batch_prepare(reqs, n, &h->bc) < 0) {
         free(h);
@@ -376,9 +433,20 @@ int phxfs_batch_wait(phxfs_batch_t *h) {
     }
     h->joined = true;
 
+    PHX_RANGE("phx.batch.wait");
+
+    if (h->staging) {
+        int fails = phx_staging_batch(h->reqs, h->staging_n, h->staging_is_write);
+        free(h);
+        return fails;
+    }
+
     int ret = 0;
-    if (h->pool_h)
+    if (h->pool_h) {
+        phx_range_push("phx.io.pool_wait");
         ret = phxfs_pool_wait(h->pool_h);
+        phx_range_pop();
+    }
 
     for (int k = 0; k < h->bc.cnt; k++)
         h->reqs[h->bc.map[k]].result = h->bc.ops[k].result;
@@ -406,6 +474,12 @@ int phxfs_batch_destroy(phxfs_batch_t *h) {
         return -EINVAL;
     }
     h->joined = true;
+
+    if (h->staging) {
+        /* Nothing was submitted at submit() time; just drop the handle. */
+        free(h);
+        return 0;
+    }
 
     if (h->pool_h)
         (void)phxfs_pool_wait(h->pool_h);
