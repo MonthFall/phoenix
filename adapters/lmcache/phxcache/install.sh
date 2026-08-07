@@ -30,11 +30,13 @@ export LIBRARY_PATH="/usr/local/lib:/usr/lib64${LIBRARY_PATH:+:$LIBRARY_PATH}"
 # Note: /usr/lib64 (liburing, libcuda) is in the default linker search path
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-# CPLUS_INCLUDE_PATH: conda compiler needs system headers (liburing.h etc.)
-export CPLUS_INCLUDE_PATH="/usr/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
-export C_INCLUDE_PATH="/usr/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+# CPATH: system headers (liburing.h etc.) — use CPATH instead of
+# CPLUS_INCLUDE_PATH to avoid breaking GCC's #include_next <stdlib.h>
+export CPATH="/usr/include${CPATH:+:$CPATH}"
 
-if [ -f /opt/rh/gcc-toolset-12/enable ]; then
+if [ -f /opt/rh/gcc-toolset-13/enable ]; then
+    source /opt/rh/gcc-toolset-13/enable
+elif [ -f /opt/rh/gcc-toolset-12/enable ]; then
     source /opt/rh/gcc-toolset-12/enable
 fi
 

@@ -188,7 +188,12 @@ std::vector<ssize_t> PhxCache::write_batch(
 
 PhxFile::PhxFile(const PhxCache &cache, const std::string &path, int flags)
     : owns_fd_(false) {
-    int fd = ::open(path.c_str(), flags);
+    // When O_CREAT is in flags, open() requires a mode argument; omitting it
+    // causes open() to read a garbage value from the stack as the file mode,
+    // which can create files with permission 0 (EACCES on subsequent opens).
+    int fd = (flags & O_CREAT)
+                 ? ::open(path.c_str(), flags, 0644)
+                 : ::open(path.c_str(), flags);
     if (fd < 0) {
         throw std::system_error(errno, std::system_category(),
                                 "PhxFile: open(" + path + ")");
