@@ -251,6 +251,71 @@ def test_multi_entry_batch(phx_loader, gpu_buffer, make_aligned_file):
 
 
 # ---------------------------------------------------------------------------
+# EOF boundary tests
+#
+# In production, offset and nbytes are always 4K-aligned (read_group.py
+# guarantees this). File sizes are arbitrary (safetensors files are not
+# 4K-aligned). When the aligned read reaches EOF, the old FULL-mode path
+# (xfer + pread) returned a short read and phxloader handled it gracefully.
+# The new staging-mode path returns EIO instead, which crashes vLLM.
+#
+# These tests verify that reading at EOF boundary works correctly —
+# the read should either succeed with a short read (like pread) or
+# be handled so that loading continues.
+# ---------------------------------------------------------------------------
+
+
+def _write_file(path, size):
+    """Create a file of exactly `size` bytes with a repeating pattern."""
+    data = bytes(range(256)) * (size // 256 + 1)
+    with open(path, "wb") as f:
+        f.write(data[:size])
+        os.fsync(f.fileno())
+    return data[:size]
+
+
+@skip_no_hardware
+def test_read_within_eof(phx_loader, gpu_buffer, tmp_path):
+    """Aligned read fully within file bounds"""
+    path = str(tmp_path / "test.bin")
+    file_data = _write_file(path, 4196)  # not 4K-aligned, but read fits
+
+    phx_loader.regmem(gpu_buffer.data_ptr(), gpu_buffer.nbytes)
+    try:
+        gpu_buffer.zero_()
+        phx_loader.load_tensors_into_buffer(path, gpu_buffer.data_ptr(), [(0, 0, 4096)])
+        got = gpu_buffer[:4096].cpu()
+        assert torch.equal(got, torch.tensor(list(file_data[:4096]), dtype=torch.uint8))
+    finally:
+        phx_loader.deregmem(gpu_buffer.data_ptr(), gpu_buffer.nbytes)
+
+
+@skip_no_hardware
+def test_read_beyond_eof(phx_loader, gpu_buffer, tmp_path):
+    """Aligned read that exceeds EOF
+
+    File is 4196 bytes (not 4K-aligned). Read requests 8192 bytes
+    (4K-aligned). The old FULL-mode path (pread) returned 4196 bytes
+    (short read) and phxloader logged it and continued. The staging-mode
+    path returns EIO, crashing vLLM.
+
+    Expected behavior: phxfs_read or phx_loader should handle the EOF
+    boundary so that the 4196 valid bytes are read and loading continues.
+    """
+    path = str(tmp_path / "test.bin")
+    file_data = _write_file(path, 4196)
+
+    phx_loader.regmem(gpu_buffer.data_ptr(), gpu_buffer.nbytes)
+    try:
+        gpu_buffer.zero_()
+        phx_loader.load_tensors_into_buffer(path, gpu_buffer.data_ptr(), [(0, 0, 8192)])
+        got = gpu_buffer[:4196].cpu()
+        assert torch.equal(got, torch.tensor(list(file_data), dtype=torch.uint8))
+    finally:
+        phx_loader.deregmem(gpu_buffer.data_ptr(), gpu_buffer.nbytes)
+
+
+# ---------------------------------------------------------------------------
 # close semantics
 # ---------------------------------------------------------------------------
 
