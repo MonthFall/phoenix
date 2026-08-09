@@ -309,15 +309,29 @@ static void run_device(int d, phxfs_io_req_t *reqs, int n, int is_write) {
             while (i < grp.size()) {
                 int ti = grp[i];
                 const Tile &t = tiles[ti];
-                if (!(got && ops[s][i].result == (ssize_t)t.len)) {
-                    reqs[t.req_idx].result = -EIO;   /* its DMA failed */
+                if (!got || ops[s][i].result < 0) {
+                    /* io_uring submission or completion failed */
+                    reqs[t.req_idx].result = -EIO;
                     i++;
                     continue;
                 }
+                /* Accept short reads (result < t.len): this happens when
+                 * the read reaches EOF on a file whose size is not aligned
+                 * to the DMA tile size.  The bytes that were read are valid
+                 * and must be copied to the user buffer. */
+                size_t bytes = (size_t)ops[s][i].result;
+                if (bytes == 0) {
+                    reqs[t.req_idx].result = 0;
+                    i++;
+                    continue;
+                }
+                /* Set short-read result so the caller knows how many bytes
+                 * were actually transferred. */
+                if (bytes < t.len)
+                    reqs[t.req_idx].result = (ssize_t)bytes;
                 /* Extend the run while both sides stay contiguous and every
-                 * tile's DMA succeeded. */
+                 * tile's DMA returned a full read (short read = EOF, stop). */
                 size_t j = i + 1;
-                size_t bytes = t.len;
                 while (j < grp.size()) {
                     int tj = grp[j];
                     const Tile &u = tiles[tj];

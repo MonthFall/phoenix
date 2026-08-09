@@ -31,12 +31,12 @@ def find_library(name, search_paths=None):
     return None
 
 
-# Find Phoenix project root
-# adapters/lmcache/phxcache/setup.py → parent×4 = Phoenix/
-PHOENIX_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-LIBPHOENIX_DIR = PHOENIX_ROOT / "libphoenix"
-LIBPHOENIX_INCLUDE = LIBPHOENIX_DIR / "include"
-LIBPHOENIX_LIB = PHOENIX_ROOT / "build"
+# libphoenix is installed system-wide at /usr/local/lib and /usr/local/include.
+# Do NOT use the workspace-local phoenix/build/ copy — it may be stale and
+# cause ABI mismatch (see 2026-08-07 investigation: phxfs_read signature
+# changed from 5 params to 6 params between versions).
+LIBPHOENIX_INCLUDE = Path("/usr/local/include")
+LIBPHOENIX_LIB = Path("/usr/local/lib")
 
 # CUDA
 cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
@@ -55,7 +55,6 @@ ext_modules = [
         ],
         library_dirs=[
             str(LIBPHOENIX_LIB),
-            "/usr/local/lib",  # libphoenix.so installed here
             os.path.join(cuda_home, "lib64"),
             os.path.join(cuda_home, "lib"),
         ],

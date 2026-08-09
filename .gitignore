@@ -17,3 +17,4 @@ temp/
 # Keep the project's shared AI developer skill tracked
 !.codebuddy/skills/
 !.codebuddy/skills/**
+*.pyc
