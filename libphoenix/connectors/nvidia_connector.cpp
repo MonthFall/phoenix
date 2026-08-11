@@ -141,6 +141,21 @@ static int nvidia_phxfs_to_cuda(int phxfs_dev)
     return -1;
 }
 
+/*
+ * Staging pool allocation.
+ *
+ * The kernel remaps the pool's BAR range in 2MiB units and requires every
+ * fresh unit to be wholly owned by the pool, so ideally we would allocate in
+ * 2MiB physical chunks. The CUDA VMM API (cuMemCreate) offers exactly that,
+ * but VMM mappings cannot be pinned by the legacy nvidia_p2p_get_pages API
+ * the kernel module uses (EINVAL), and the DMA-BUF P2P path that supports
+ * VMM requires kernel >= 5.12 -- so on kernel 5.4 the pool must stay on
+ * cudaMalloc. Large cudaMalloc allocations are backed by 2MiB large pages in
+ * practice, which tiles the kernel's units; if the driver ever falls back to
+ * 64KiB small pages (fragmentation), the kernel's exclusive-unit check
+ * rejects the registration loudly instead of silently breaking RDMA/peermem
+ * registration of unrelated GPU memory.
+ */
 static int nvidia_mem_alloc(int phxfs_dev, size_t size, void **dptr)
 {
     if (!dptr)

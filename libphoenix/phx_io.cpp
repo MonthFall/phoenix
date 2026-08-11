@@ -241,9 +241,9 @@ static void batch_ctx_free(struct batch_ctx *bc) {
 /* Release mapping refs, then per-device operation refs. Order matters:
  * mapping refs must drop before dev_put lets a draining close() proceed. */
 static void batch_ctx_release(struct batch_ctx *bc) {
-    for (int k = 0; k < bc->cnt; k++)
-        if (bc->nodes[k])
-            map_release(&mbuffer[bc->devs[k]], bc->nodes[k]);
+    /* One lock acquisition per device for the whole batch (nodes of CPU
+     * requests are NULL and skipped). */
+    batch_release_mappings(bc->devs, bc->nodes, bc->cnt);
     for (int d = 0; d < g_device_count; d++)
         if (bc->dev_held[d])
             dev_put(&mbuffer[d]);
@@ -262,7 +262,9 @@ static int phxfs_batch_prepare(phxfs_io_req_t *reqs, int n, struct batch_ctx *bc
     bc->map   = (int *)malloc((size_t)n * sizeof(*bc->map));
     bc->nodes = (phxfs_p2p_map_t **)malloc((size_t)n * sizeof(*bc->nodes));
     bc->devs  = (int *)malloc((size_t)n * sizeof(*bc->devs));
-    if (!bc->ops || !bc->map || !bc->nodes || !bc->devs) {
+    void **hosts = (void **)malloc((size_t)n * sizeof(*hosts));
+    if (!bc->ops || !bc->map || !bc->nodes || !bc->devs || !hosts) {
+        free(hosts);
         batch_ctx_free(bc);
         return -ENOMEM;
     }
@@ -275,11 +277,18 @@ static int phxfs_batch_prepare(phxfs_io_req_t *reqs, int n, struct batch_ctx *bc
                 bc->dev_held[d] = true;
     }
 
+    /* Resolve every GPU request against its device's registration table in a
+     * single pass: one mapping-lock acquisition per device for the whole
+     * batch instead of one lock/unlock pair per request. Skipped requests
+     * (CPU buffers, invalid ids/offsets, un-held devices, unregistered
+     * buffers) keep hosts[i] == NULL and fail below. */
+    batch_resolve_registered(reqs, n, bc->dev_held, hosts, bc->nodes);
+
     int cnt = 0, fail = 0;
     for (int i = 0; i < n; i++) {
         int d = reqs[i].device_id;
-        void *host = NULL;
-        phxfs_p2p_map_t *node = NULL;
+        void *host = hosts[i];
+        phxfs_p2p_map_t *node = bc->nodes[i];
 
         /* Reject a negative file offset and an f_offset+nbytes that would
          * overflow off_t before doing any address resolution. */
@@ -288,17 +297,13 @@ static int phxfs_batch_prepare(phxfs_io_req_t *reqs, int n, struct batch_ctx *bc
                          (uint64_t)INT64_MAX - (uint64_t)reqs[i].f_offset;
 
         if (!valid) {
-            host = NULL;
+            host = NULL;   /* batch_resolve skipped it: node is NULL */
         } else if (d < 0) {
             /* CPU buffer (caller-owned host memory). */
             resolve_cpu_buf(reqs[i].buf, reqs[i].buf_offset, reqs[i].nbytes, &host);
-        } else if (d < g_device_count && bc->dev_held[d]) {
-            /* GPU buffer: must resolve to a registered mapping. */
-            if (resolve_registered(d, reqs[i].buf, reqs[i].buf_offset,
-                                   reqs[i].nbytes, &host, &node) != 1)
-                host = NULL;
+            node = NULL;
         }
-        /* else: invalid range or unacquirable (closing) device -> fail. */
+        /* else GPU buffer: host/node already resolved above. */
 
         if (!host) {
             reqs[i].result = -EFAULT;
@@ -315,6 +320,7 @@ static int phxfs_batch_prepare(phxfs_io_req_t *reqs, int n, struct batch_ctx *bc
         bc->devs[cnt] = d;
         cnt++;
     }
+    free(hosts);
     bc->cnt = cnt;
     bc->resolve_fail = fail;
     return 0;

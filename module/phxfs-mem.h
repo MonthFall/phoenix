@@ -28,8 +28,8 @@ struct phxfs_mmap_buffer {
     struct phxfs_dev *dev;
     bool remap; // if vma remap_pfn_range set true, otherwise false
     struct p2p_vmap* map;
-    u64 *unit_starts;/* staging BAR units referenced by this buffer */
-    unsigned int nr_units;
+    u64 staging_span;/* start of the staging BAR span this buffer holds a
+                      * reference on (0 = none) */
 };
 typedef struct phxfs_mmap_buffer* phxfs_mmap_buffer_t;
 

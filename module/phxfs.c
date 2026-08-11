@@ -661,97 +661,92 @@ static int phxfs_remap_span_locked(struct phxfs_dev *phx_dev, u64 phys_start,
 	return 0;
 }
 
-int phxfs_staging_ensure_units(struct phxfs_dev *dev, const u64 *phys,
-			       unsigned long n, u64 **out_units,
-			       unsigned int *out_nr_units)
+int phxfs_staging_ensure_span(struct phxfs_dev *dev, const u64 *phys,
+			      unsigned long n, size_t page_size,
+			      u64 *out_span_start)
 {
-	u64 bar_end;
-	u64 *units;
-	unsigned int nr_units = 0;
+	u64 span_start, span_size, bar_end;
 	unsigned long i;
-	int ret = 0;
+	int idx, ret = 0;
 
-	if (!dev || !phys || !out_units || !out_nr_units)
+	if (!dev || !phys || !out_span_start || n == 0 || page_size == 0)
 		return -EINVAL;
 
-	*out_units = NULL;
-	*out_nr_units = 0;
-	if (n == 0)
-		return 0;
-
-	/*
-	 * One entry per page is the worst case (unsorted input); consecutive
-	 * pages sharing a unit collapse to one entry. Duplicate entries would
-	 * be harmless anyway -- ensure/put are symmetric per entry.
-	 */
-	units = kvmalloc_array(n, sizeof(*units), GFP_KERNEL);
-	if (!units)
-		return -ENOMEM;
-
+	*out_span_start = 0;
+	span_start = phys[0];
+	span_size = (u64)n * page_size;
 	bar_end = dev->paddr + dev->size;
 
-	mutex_lock(&dev->seg_lock);
-	for (i = 0; i < n; i++) {
-		u64 off, unit_start, unit_end;
-		int idx;
+	if (span_start < dev->paddr || span_start >= bar_end ||
+	    span_size > bar_end - span_start) {
+		phxfs_err("phxfs%d: pinned span [0x%llx+0x%llx) outside BAR "
+		       "[0x%llx-0x%llx)\n", dev->idx, span_start, span_size,
+		       dev->paddr, bar_end);
+		return -ERANGE;
+	}
 
-		if (phys[i] < dev->paddr || phys[i] >= bar_end) {
-			phxfs_err("phxfs%d: pinned page 0x%llx outside BAR "
-			       "[0x%llx-0x%llx)\n", dev->idx, phys[i],
-			       dev->paddr, bar_end);
-			ret = -ERANGE;
-			break;
-		}
-
-		/* Align on a BAR-relative grid so a unit never straddles the
-		 * BAR base even if paddr is not unit-aligned. */
-		off = (phys[i] - dev->paddr) & ~(PHXFS_REMAP_UNIT_SIZE - 1);
-		unit_start = dev->paddr + off;
-
-		/* Fast path: same unit as the previous page. */
-		if (nr_units && units[nr_units - 1] == unit_start)
+	/*
+	 * Remap what was registered and nothing more. That needs the pinned
+	 * pages to form one dense ascending run, aligned and sized to the
+	 * granularity at which struct pages can be handed out at all (see
+	 * PHXFS_REMAP_ALIGN). Any other layout would force the remap to also
+	 * cover foreign GPU pages, which would then fail RDMA/peermem
+	 * registration -- refuse loudly instead of breaking them silently.
+	 */
+	for (i = 1; i < n; i++) {
+		if (phys[i] == span_start + (u64)i * page_size)
 			continue;
+		phxfs_err("phxfs%d: staging pool is not one contiguous BAR span "
+		       "(page %lu at 0x%llx, expected 0x%llx)\n",
+		       dev->idx, i, phys[i], span_start + (u64)i * page_size);
+		return -EINVAL;
+	}
+	if (!IS_ALIGNED(span_start, PHXFS_REMAP_ALIGN) ||
+	    !IS_ALIGNED(span_size, PHXFS_REMAP_ALIGN)) {
+		phxfs_err("phxfs%d: staging span [0x%llx+0x%llx) is not %llu MiB "
+		       "aligned and sized; remapping it would also expose "
+		       "neighbouring GPU memory\n", dev->idx, span_start,
+		       span_size, PHXFS_REMAP_ALIGN >> 20);
+		return -EINVAL;
+	}
 
-		idx = seg_find_locked(dev, phys[i], NULL);
-		if (idx < 0) {
-			unit_end = unit_start + PHXFS_REMAP_UNIT_SIZE;
-			if (unit_end > bar_end)
-				unit_end = bar_end;
-			ret = phxfs_remap_span_locked(dev, unit_start, unit_end);
-			if (ret)
-				break;
-			idx = seg_find_locked(dev, phys[i], NULL);
+	mutex_lock(&dev->seg_lock);
+	idx = seg_find_locked(dev, span_start, NULL);
+	if (idx >= 0) {
+		/*
+		 * Re-adopt the span an earlier registration mapped, but only if
+		 * it is the very same span: anything else means the two
+		 * registrations disagree about the BAR range, and growing or
+		 * splitting a live segment is exactly what we refuse to do.
+		 */
+		if (dev->segments[idx].phys_start != span_start ||
+		    dev->segments[idx].size != span_size) {
+			phxfs_err("phxfs%d: staging span [0x%llx+0x%llx) "
+			       "conflicts with mapped segment [0x%llx+0x%llx)\n",
+			       dev->idx, span_start, span_size,
+			       dev->segments[idx].phys_start,
+			       dev->segments[idx].size);
+			ret = -EINVAL;
+		}
+	} else {
+		ret = phxfs_remap_span_locked(dev, span_start,
+					      span_start + span_size);
+		if (!ret) {
+			idx = seg_find_locked(dev, span_start, NULL);
 			if (idx < 0) {   /* cannot happen; be loud, not silent */
-				phxfs_err("phxfs%d: unit 0x%llx missing right "
-				       "after remap\n", dev->idx, unit_start);
+				phxfs_err("phxfs%d: span 0x%llx missing right "
+				       "after remap\n", dev->idx, span_start);
 				ret = -EFAULT;
-				break;
 			}
 		}
+	}
+	if (!ret)
 		dev->segments[idx].refcount++;
-		units[nr_units++] = unit_start;
-	}
-
-	if (ret) {
-		/* Roll back this call's references; created units stay mapped
-		 * with refcount 0, i.e. reusable. */
-		unsigned int u;
-
-		for (u = 0; u < nr_units; u++) {
-			int idx = seg_find_locked(dev, units[u], NULL);
-
-			if (idx >= 0 && dev->segments[idx].refcount > 0)
-				dev->segments[idx].refcount--;
-		}
-		mutex_unlock(&dev->seg_lock);
-		kvfree(units);
-		return ret;
-	}
 	mutex_unlock(&dev->seg_lock);
 
-	*out_units = units;
-	*out_nr_units = nr_units;
-	return 0;
+	if (!ret)
+		*out_span_start = span_start;
+	return ret;
 }
 
 /*
@@ -839,32 +834,25 @@ static void phxfs_seg_release_work_fn(struct work_struct *work)
 	mutex_unlock(&dev->seg_lock);
 }
 
-void phxfs_staging_put_units(struct phxfs_dev *dev, const u64 *units,
-			     unsigned int nr_units)
+void phxfs_staging_put_span(struct phxfs_dev *dev, u64 span_start)
 {
 	bool freed = false;
-	unsigned int u;
+	int idx;
 
-	if (!dev || !units || nr_units == 0)
+	if (!dev || !span_start)
 		return;
 
 	mutex_lock(&dev->seg_lock);
-	for (u = 0; u < nr_units; u++) {
-		int idx = seg_find_locked(dev, units[u], NULL);
+	idx = seg_find_locked(dev, span_start, NULL);
+	if (idx < 0)
+		phxfs_warn("phxfs%d: put of unknown span 0x%llx\n",
+		       dev->idx, span_start);
+	else if (dev->segments[idx].refcount <= 0)
+		phxfs_warn("phxfs%d: unbalanced put on span 0x%llx\n",
+		       dev->idx, span_start);
+	else if (--dev->segments[idx].refcount == 0)
+		freed = true;
 
-		if (idx < 0) {
-			phxfs_warn("phxfs%d: put of unknown unit 0x%llx\n",
-			       dev->idx, units[u]);
-			continue;
-		}
-		if (dev->segments[idx].refcount <= 0) {
-			phxfs_warn("phxfs%d: unbalanced put on unit 0x%llx\n",
-			       dev->idx, units[u]);
-			continue;
-		}
-		if (--dev->segments[idx].refcount == 0)
-			freed = true;
-	}
 	if (freed && phxfs_staging_release) {
 		dev->seg_release_tries = 25;   /* ~5 s of retries, then give up */
 		schedule_delayed_work(&dev->seg_release_work, 0);

@@ -65,6 +65,7 @@ static void phxfs_dev_ctor(void) {
         mbuffer[i].head       = NULL;
         mbuffer[i].last_hit   = NULL;
         mbuffer[i].map_mode     = PHX_MAP_MODE_FULL;
+        mbuffer[i].staging_raw  = NULL;
         mbuffer[i].staging_dptr = NULL;
         mbuffer[i].staging_host = NULL;
         mbuffer[i].staging_size = 0;
@@ -188,6 +189,7 @@ static int __phxfs_open(const char *dev_path, phxfs_mmap_buffer_t *mbuffer,
     mbuffer->closing = false;
     mbuffer->active_ops = 0;
     mbuffer->map_mode = phxfs_read_map_mode(device_id);
+    mbuffer->staging_raw = NULL;
     mbuffer->staging_dptr = NULL;
     mbuffer->staging_host = NULL;
     mbuffer->staging_size = 0;
@@ -251,4 +253,8 @@ int phxfs_find_dev(int device_id) {
 
 uint64_t phxfs_get_page_size(void) {
     return devconn->page_size;
+}
+
+int phxfs_get_map_mode(int device_id) {
+    return phxfs_read_map_mode(device_id);
 }

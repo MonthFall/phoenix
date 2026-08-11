@@ -31,8 +31,19 @@
 #define PHX_STAGING_SLOTS       2
 #define PHX_STAGING_DEFAULT_MB  256
 
+/*
+ * Staging pool granularity. The kernel remaps exactly the pool's BAR span, and
+ * struct-page presence can only be toggled per sparsemem sub-section (2MiB),
+ * so a pool that is not 2MiB-aligned and -sized would drag neighbouring GPU
+ * memory into the remap and cost it its RDMA/peermem registerability. The
+ * kernel therefore requires -- and rejects registrations that violate -- this
+ * alignment, and we allocate the pool accordingly.
+ */
+#define PHX_STAGING_GRANULARITY ((size_t)2 * 1024 * 1024)
+
 /* Staging pool size: env override PHX_STAGING_SIZE_MB, else the default,
- * rounded down to a multiple of (SLOTS * 64KiB) and never below one unit. */
+ * rounded up to a multiple of PHX_STAGING_GRANULARITY. With 2 slots the
+ * per-slot size stays a multiple of 1MiB, hence 64KiB-aligned. */
 static size_t staging_size_bytes(void) {
     size_t mb = PHX_STAGING_DEFAULT_MB;
     const char *env = getenv("PHX_STAGING_SIZE_MB");
@@ -41,10 +52,10 @@ static size_t staging_size_bytes(void) {
         if (v > 0)
             mb = (size_t)v;
     }
-    size_t unit = (size_t)PHX_STAGING_SLOTS * HUGE_PAGE_SIZE;
-    size_t sz = (mb * 1024 * 1024 / unit) * unit;
-    if (sz < unit)
-        sz = unit;
+    size_t sz = (mb * 1024 * 1024 + PHX_STAGING_GRANULARITY - 1) /
+                PHX_STAGING_GRANULARITY * PHX_STAGING_GRANULARITY;
+    if (sz < PHX_STAGING_GRANULARITY)
+        sz = PHX_STAGING_GRANULARITY;
     return sz;
 }
 
@@ -67,33 +78,31 @@ int phx_staging_setup(int device_id) {
         return -EINVAL;
 
     size_t sz = staging_size_bytes();
-    void *dptr = NULL;
-    int rc = devconn->mem_alloc(device_id, sz, &dptr);
+    /* Device allocators take no alignment hint, so over-allocate by one
+     * granule and place the pool at the first aligned address inside it. This
+     * makes the pool's virtual span 2MiB-aligned and -sized; the BAR offsets it
+     * is pinned at are still the driver's choice, and the kernel rejects the
+     * registration loudly if they do not come out aligned and contiguous. */
+    void *raw = NULL;
+    int rc = devconn->mem_alloc(device_id, sz + PHX_STAGING_GRANULARITY, &raw);
     if (rc != 0) {
         dev_put(pb);
         return rc;
     }
-    /* The kernel pins/inserts staging pages by their 64KiB device page, so the
-     * pool base must be 64KiB-aligned (device allocations of this size are in
-     * practice, but check rather than mis-pin silently). */
-    if ((uintptr_t)dptr % HUGE_PAGE_SIZE != 0) {
-        fprintf(stderr, "phx_staging: staging pool %p not %d-byte aligned\n",
-                dptr, HUGE_PAGE_SIZE);
-        devconn->mem_free(dptr);
-        dev_put(pb);
-        return -EINVAL;
-    }
+    void *dptr = (void *)(((uintptr_t)raw + PHX_STAGING_GRANULARITY - 1) &
+                          ~(uintptr_t)(PHX_STAGING_GRANULARITY - 1));
 
     /* Real (non-no-op) registration of the staging pool; this is the single
      * buffer that triggers the kernel's bounded staging remap. */
     void *host = NULL;
     rc = phx_regmem_internal(pb, dptr, sz, &host);
     if (rc != 0) {
-        devconn->mem_free(dptr);
+        devconn->mem_free(raw);
         dev_put(pb);
         return rc;
     }
 
+    pb->staging_raw = raw;
     pb->staging_dptr = dptr;
     pb->staging_host = host;
     pb->staging_size = sz;
@@ -105,8 +114,9 @@ void phx_staging_teardown(phxfs_mmap_buffer_t *pb) {
     /* The staging registration node itself is torn down by
      * free_phxfs_p2p_map() before this runs; here we only release the device
      * allocation. */
-    if (pb->staging_dptr && devconn && devconn->mem_free)
-        devconn->mem_free(pb->staging_dptr);
+    if (pb->staging_raw && devconn && devconn->mem_free)
+        devconn->mem_free(pb->staging_raw);
+    pb->staging_raw = NULL;
     pb->staging_dptr = NULL;
     pb->staging_host = NULL;
     pb->staging_size = 0;

@@ -290,20 +290,18 @@ int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_l
     }
 
     /*
-     * Staging mode: the BAR was NOT remapped at probe. Remap exactly the
-     * PHXFS_REMAP_UNIT_SIZE units this buffer's BAR pages fall into, reusing
-     * units an earlier registration already mapped. This must run on *every*
-     * registration, not just the first on the device: the BAR offsets a buffer
-     * is pinned at are picked by the GPU driver per pin, so a second process
-     * (or the same program run with a different allocation history) lands on
-     * different units. Only the touched units get struct pages; the rest of
-     * the BAR keeps pfn_valid == false so user GPU memory stays registerable
-     * by RDMA/peermem.
+     * Staging mode: the BAR was NOT remapped at probe. Remap exactly the BAR
+     * span this buffer occupies, reusing a span an earlier registration
+     * already mapped. This must run on *every* registration, not just the
+     * first on the device: the BAR offsets a buffer is pinned at are picked by
+     * the GPU driver per pin, so a second process (or the same program run
+     * with a different allocation history) lands on a different span. Only
+     * that span gets struct pages; the rest of the BAR keeps pfn_valid ==
+     * false so user GPU memory stays registerable by RDMA/peermem.
      */
     if (phxfs_map_mode == PHXFS_MAP_MODE_STAGING) {
-        ret = phxfs_staging_ensure_units(dev, dev_page_addrs, nr_dev_pages,
-                                        &mbuffer->unit_starts,
-                                        &mbuffer->nr_units);
+        ret = phxfs_staging_ensure_span(dev, dev_page_addrs, nr_dev_pages,
+                                        page_size, &mbuffer->staging_span);
         if (ret) {
             phxfs_err("phxfs%d: staging remap failed: %d\n", dev->idx, ret);
             goto out;
@@ -389,12 +387,10 @@ out:
         kvfree(dev_page_addrs);
         mbuffer->dev_page_addrs = NULL;
     }
-    /* Give back the staging units this attempt referenced. */
-    if (mbuffer->unit_starts != NULL) {
-        phxfs_staging_put_units(dev, mbuffer->unit_starts, mbuffer->nr_units);
-        kvfree(mbuffer->unit_starts);
-        mbuffer->unit_starts = NULL;
-        mbuffer->nr_units = 0;
+    /* Give back the staging span this attempt referenced. */
+    if (mbuffer->staging_span != 0) {
+        phxfs_staging_put_span(dev, mbuffer->staging_span);
+        mbuffer->staging_span = 0;
     }
 
     return ret;
@@ -455,15 +451,12 @@ static void phxfs_mbuffer_free(phxfs_mmap_buffer_t mbuffer) {
 
     /*
      * Only now, with the VMA (and therefore every page table entry pointing at
-     * the BAR pages) gone, is it safe to give the staging BAR units back: the
-     * release worker can find their pages idle and unmap them.
+     * the BAR pages) gone, is it safe to give the staging BAR span back: the
+     * release worker can find its pages idle and unmap them.
      */
-    if (mbuffer->unit_starts != NULL) {
-        phxfs_staging_put_units(mbuffer->dev, mbuffer->unit_starts,
-                                mbuffer->nr_units);
-        kvfree(mbuffer->unit_starts);
-        mbuffer->unit_starts = NULL;
-        mbuffer->nr_units = 0;
+    if (mbuffer->staging_span != 0) {
+        phxfs_staging_put_span(mbuffer->dev, mbuffer->staging_span);
+        mbuffer->staging_span = 0;
     }
 
     if (mbuffer->dev_page_addrs != NULL) {
@@ -600,8 +593,7 @@ int phxfs_add_phony_buffer(struct file *filp, struct vm_area_struct *vma) {
     phxfs_mbuffer->c_vaddr = vma->vm_start;
     phxfs_mbuffer->map_len = buffer_len;
     phxfs_mbuffer->remap = 0;
-    phxfs_mbuffer->unit_starts = NULL;
-    phxfs_mbuffer->nr_units = 0;
+    phxfs_mbuffer->staging_span = 0;
 
     return 0;
 

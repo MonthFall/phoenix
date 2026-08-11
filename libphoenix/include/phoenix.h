@@ -27,6 +27,15 @@ int phxfs_close(int device_id);
 uint64_t phxfs_get_page_size(void);
 
 /*
+ * Returns the BAR mapping mode of a phxfs device:
+ *   0 (FULL):    entire BAR remapped at probe; phxfs_regmem pins user pages
+ *   1 (STAGING): kernel maps only an internal staging pool; phxfs_regmem is
+ *                a no-op and reads are routed SSD->staging->D2D->user buffer
+ * Returns negative errno if the device is not present.
+ */
+int phxfs_get_map_mode(int device_id);
+
+/*
  * Map a vendor-specific device ID to a phxfs device index.
  * The vendor is selected at build time (PHXFS_VENDOR).
  *   NVIDIA: device_id is a CUDA device ID

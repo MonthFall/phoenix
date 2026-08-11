@@ -77,6 +77,7 @@ typedef struct phxfs_mmap_buffer_s {
 
     /* ---- Staging mode (PHX_MAP_MODE_STAGING) ---- */
     int    map_mode;        /* PHX_MAP_MODE_* (read from kernel at open) */
+    void  *staging_raw;     /* raw device allocation backing the pool (freed) */
     void  *staging_dptr;    /* Phoenix-owned device staging pool (or NULL) */
     void  *staging_host;    /* host-mapped P2P vaddr of the staging pool */
     size_t staging_size;    /* staging pool byte size */
@@ -94,6 +95,17 @@ void free_phxfs_p2p_map(phxfs_mmap_buffer_t *buffer);
 void map_release(phxfs_mmap_buffer_t *mbuffer, phxfs_p2p_map_t *m);
 int resolve_registered(int device_id, const void *buf, off_t buf_offset,
                        size_t nbyte, void **host, phxfs_p2p_map_t **out_node);
+/* Batch variants used by phx_io.cpp's batch path: same per-request semantics
+ * as resolve_registered()/map_release(), but take each device's mapping lock
+ * once per device for the whole batch instead of once per request.
+ * dev_held: caller's per-device dev_get() success array (PHXFS_MAX_DEVICES).
+ * Skipped requests (NULL outputs): CPU buffers, invalid device ids, un-held
+ * devices, negative buf_offset, f_offset+nbytes overflow. */
+void batch_resolve_registered(const phxfs_io_req_t *reqs, int n,
+                              const bool *dev_held, void **hosts,
+                              phxfs_p2p_map_t **nodes);
+void batch_release_mappings(const int *devs, phxfs_p2p_map_t *const *nodes,
+                            int n);
 /* Real (non-no-op) registration used by the staging pool. Caller holds a
  * dev_get() reference on pb. Returns 0, or a negative errno. */
 int phx_regmem_internal(phxfs_mmap_buffer_t *pb, const void *addr, size_t len,
