@@ -297,6 +297,34 @@ static int nvidia_queue_sync(int phxfs_dev, int slot)
 }
 
 /* ------------------------------------------------------------------ */
+/* Stream-ordered I/O primitive (host-function model)                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Enqueue a host callback on the user stream. CUDA guarantees the callback
+ * runs after all previously enqueued work on the stream and blocks all work
+ * enqueued after it — the entire ordering contract of phx_stream.cpp rests
+ * on this. Consecutive host functions on one stream are officially
+ * supported ("the stream will remain idle across consecutive host
+ * functions"). The callback itself must not make CUDA API calls; the core
+ * only runs pure-host I/O inside it.
+ */
+static int nvidia_launch_host_func(void *stream,
+                                   void (*fn)(void *), void *arg)
+{
+    if (!stream || !fn)
+        return -EINVAL;
+    cudaError_t rc = cudaLaunchHostFunc((cudaStream_t)stream,
+                                        (cudaHostFn_t)fn, arg);
+    if (rc != cudaSuccess) {
+        fprintf(stderr, "nvidia_launch_host_func: %s\n",
+                cudaGetErrorString(rc));
+        return -EIO;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Profiler ranges (NVTX)*/
 /* ------------------------------------------------------------------ */
 
@@ -339,6 +367,7 @@ static struct devconn_ops nvidia_devconn = {
     .memcpy_dtod  = nvidia_memcpy_dtod,
     .memcpy_dtod_async = nvidia_memcpy_dtod_async,
     .queue_sync   = nvidia_queue_sync,
+    .launch_host_func = nvidia_launch_host_func,
 #ifdef PHX_NVTX
     .range_push   = nvidia_range_push,
     .range_pop    = nvidia_range_pop,

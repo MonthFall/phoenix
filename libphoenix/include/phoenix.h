@@ -170,6 +170,70 @@ int phxfs_batch_destroy(phxfs_batch_t *handle);
  */
 const char *phxfs_io_engine_name(void);
 
+/* ------------------------------------------------------------------ *
+ * Stream-ordered asynchronous I/O (host-function model)
+ *
+ * phxfs_read_stream / phxfs_write_stream present a cuFile/uGDS-like async
+ * API. Ordering model: the DMA runs INSIDE a host callback that CUDA
+ * enqueues on the user stream (cudaLaunchHostFunc semantics). CUDA
+ * guarantees the callback is "called after currently enqueued work and
+ * will block work added after it", so
+ *
+ *   - a READ's later consumers on the stream see the DMA'd data,
+ *   - a WRITE's preceding gather kernels complete before the DMA reads.
+ *
+ * ...by construction — no events, no drain loop, no submit-vs-consumer
+ * race. A bare cudaStreamSynchronize() on the caller side is therefore
+ * ALWAYS safe (this differs from the earlier event-bridge design).
+ * Consecutive submissions on one stream execute in submission order
+ * (consecutive host functions are officially supported).
+ *
+ * There is NO stream registration: like cuFileReadAsync / cuFileWriteAsync,
+ * every submission carries the stream handle; there is no per-stream
+ * state to set up or tear down.
+ *
+ * Staging-mode devices (map_mode=staging) are NOT supported by the stream
+ * API: their two-hop path (SSD -> staging pool -> D2D -> user) would need
+ * the D2D leg inside or around the callback, which CUDA forbids.
+ * Submissions whose buffer device is staging fail with -EOPNOTSUPP;
+ * staging devices keep using the synchronous phxfs_read / phxfs_write
+ * (and the batch API). Stream-ordered staging support is planned.
+ *
+ * Submission contract (mirrors cuFileReadAsync/WriteAsync):
+ *   - nbytes / buf_offset / f_offset point at caller-owned storage whose
+ *     values are read at submission time; *bytes_done is written by the
+ *     library. ALL of this storage must stay valid and unmodified until
+ *     the submission has completed (stream synchronized).
+ *   - after the stream passes the submission, *bytes_done holds the
+ *     transferred byte count, or a negative errno of the failure. A
+ *     failed DMA never stalls the stream: the callback always returns.
+ *   - fd, the I/O buffer and (for GPU buffers) its phxfs_regmem
+ *     registration must stay valid until the stream is synchronized
+ *     past the submission. The library takes NO internal references —
+ *     a deregistration racing an in-flight DMA is a caller error.
+ *     Synchronize the stream before deregistering (the same rule
+ *     cuFileReadAsync / cuFileWriteAsync users follow).
+ *   - the buffer device is resolved from the buffer itself, like
+ *     cuFileReadAsync: a buf inside any opened device's registration
+ *     table is a GPU buffer (DMA against its P2P host address; a
+ *     staging-mode device fails with -EOPNOTSUPP); a buf inside no
+ *     registration is a plain CPU address. An extent sticking out of
+ *     its registration fails with -EFAULT.
+ *   - returns 0 if the submission was accepted (I/O outcome is reported
+ *     through *bytes_done), or a negative errno for submission-level
+ *     failures (bad args, callback enqueue failure...).
+ *
+ * Vendor requirement: the connector must provide the launch_host_func
+ * primitive; without it submissions fail with -EOPNOTSUPP. There is no
+ * synchronous fallback.
+ * ------------------------------------------------------------------ */
+int phxfs_read_stream(int fd, void *buf, size_t *nbytes,
+                      off_t *buf_offset, off_t *f_offset,
+                      ssize_t *bytes_done, void *stream);
+int phxfs_write_stream(int fd, void *buf, size_t *nbytes,
+                       off_t *buf_offset, off_t *f_offset,
+                       ssize_t *bytes_done, void *stream);
+
 #ifdef __cplusplus
 }
 #endif
