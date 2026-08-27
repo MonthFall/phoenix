@@ -11,6 +11,7 @@ Welcome to the Phoenix documentation. Phoenix is a middleware that enables **dir
 | [kernel-module.md](kernel-module.md) | `phxfs` kernel module design and interfaces |
 | [libphoenix.md](libphoenix.md) | User-space C/C++ library API (`libphoenix`) |
 | [adapters.md](adapters.md) | Application adapters: vLLM (available) and lmcache (integration guide) |
+| [vendor-porting-guide.md](vendor-porting-guide.md) | GPU vendor porting guide (kernel P2P backend + user-space connector), bilingual 中英双语 |
 | [troubleshooting.md](troubleshooting.md) | Kernel-module install troubleshooting |
 | [roadmap.md](roadmap.md) | Engineering tasks and research directions |
 
