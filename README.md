@@ -7,7 +7,8 @@ Phoenix is a rebuilt version of GPU Direct Storage (GDS) that lets data flow str
 > 📄 Built on the SC'25 paper *"Phoenix: A Refactored I/O Stack for GPU Direct Storage without Phony Buffers"*. Phoenix is now a long-term open-source middleware for storage→xPU I/O, with adapters for AI data (vLLM done; lmcache planned).
 ## 📰 News
 
-- **2026.8.27** — [LMCache Phoenix backend released and merged into upstream](https://github.com/LMCache/LMCache/pull/4673), 
+- **2026.8.27** — [LMCache Phoenix backend released and merged into upstream](https://github.com/LMCache/LMCache/pull/4673),
+- **2026.8.20 Stream-Ordered I/O** - Phoenix now supports stream-ordered asynchronous I/O. The new `phxfs_read_stream` / `phxfs_write_stream` APIs take the stream with each submission, no registration required. Since the DMA is host-driven and invisible to the accelerator runtime, the transfer runs inside a host callback enqueued on the stream via the vendor connector's `launch_host_func` primitive — stream semantics then order read consumers and write gathers by construction, a bare stream synchronize is always sufficient.
 - **2026.8.6 staging buffer mode** — new `phxfs_map_mode=1` remaps only the BAR units each registered buffer touches (on demand, refcounted, released when idle) instead of the whole GPU BAR, so the rest of the BAR stays `pfn_valid=false` and GPUDirect RDMA / peer-memory (`ibv_reg_mr`) can coexist with Phoenix on the same GPU — the full-BAR mapping previously made peer MMIO unmappable by `dma_map_resource`.
 - **2026.7.21 batch I/O API** — `phxfs_read_batch`/`phxfs_write_batch` and async `phxfs_batch_submit_*`/`phxfs_batch_wait`, backed by an `io_uring` engine and a NUMA-aware thread pool; removes per-request syscall overhead for KV-cache / weight-loading workloads.
 - **2026.7.10 phxloader released** — adapter for **vLLM**: safetensors weight loading via DMA straight into GPU memory (`--load-format phxsafetensors`).
