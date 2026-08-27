@@ -4,21 +4,51 @@
 
 - **OS**: Linux x86_64
 - **Kernel**: a kernel source / module tree matching your running kernel (to build `phxfs`)
-- **CUDA**: a CUDA toolkit (its installer provides the matching NVIDIA driver; used by the NVIDIA vendor backend). No `nvidia-fs` / GDS needed
-- **Build tools**: CMake ≥ 3.18, a CUDA-capable toolchain, `liburing`
+- **Accelerator runtime**: a vendor runtime supported by Phoenix (see
+  [Supported accelerators](#supported-accelerators) below). Phoenix does **not** require any
+  vendor-specific direct-storage plugin (e.g. NVIDIA `nvidia-fs` / GPUDirect Storage), a specific
+  filesystem, or any RDMA stack.
+- **Build tools**: CMake ≥ 3.18, the compiler toolchain for your chosen vendor, `liburing`
 
-Phoenix is self-contained: it does **not** require GPUDirect Storage (`nvidia-fs`), a specific
-filesystem, or any RDMA stack. It issues `O_DIRECT` I/O on whatever fd the application opens.
+Phoenix is self-contained: it works at the VFS / block layer and only needs a valid `fd`. It
+issues `O_DIRECT` I/O on whatever fd the application opens — local ext4 / xfs or a parallel
+filesystem (BeeGFS / Lustre) are transparent, no direct-storage support-list required.
 
 ### Supported accelerators
 
-Phoenix currently builds against the **NVIDIA** vendor backend. The same connector
-(`libphoenix/connectors/nvidia_connector.cpp`) is reused on **MetaX (沐曦)** GPUs, because
+Phoenix is vendor-agnostic by construction: a single compile-time switch, `PHXFS_VENDOR`,
+selects the accelerator backend, and the same upper-layer / adapter code runs on any supported
+vendor. Core code never references vendor APIs directly — it calls through a function-pointer
+table (`phxfs_p2p` in the kernel, `devconn` in the user library).
+
+| Vendor | `PHXFS_VENDOR` | Runtime requirement | Status |
+| --- | --- | --- | --- |
+| NVIDIA | `NVIDIA` (default) | CUDA Toolkit 12.4+ + NVIDIA driver | ✅ Shipped |
+| MetaX (沐曦) | `METAX` | MACA SDK (CUDA-compatible) | ✅ Shipped (reuses the CUDA connector) |
+
+ AMD/Huawei NPU/Moore Threads (摩尔线程) is comming soon.
+
+Vendor-specific setup steps for each shipped backend are below; the common build procedure is
+in [§2 Build Phoenix](#2-build-phoenix).
+
+#### Running on NVIDIA
+
+1. Install the NVIDIA driver and the CUDA Toolkit 12.4 or newer
+   (the CUDA installer ships the matching driver).
+2. Confirm the driver is loaded:
+   ```shell
+   nvidia-smi
+   ```
+3. Build Phoenix with the default `NVIDIA` vendor (no `-DPHXFS_VENDOR` flag needed) — see
+   [§2 Build Phoenix](#2-build-phoenix).
+
+#### Running on MetaX (沐曦)
+
 MetaX's MACA SDK ships a CUDA-compatible runtime — `cudaMalloc`, `cudaMemcpyAsync`,
 `cudaLaunchHostFunc`, BDF queries via `cudaDeviceGetPCIBusId`, etc. all work as-is, so
-the connector needs no MetaX-specific code path.
+Phoenix reuses the same CUDA connector for MetaX with no MetaX-specific code path.
 
-To run on a MetaX card:
+To build / run on a MetaX card:
 
 1. Install the MACA driver and MACA SDK from
    <https://developer.metax-tech.com/softnova> (download the **Driver** and **SDK** packages).
@@ -27,32 +57,41 @@ To run on a MetaX card:
    export MACA_PATH=/opt/maca
    export LD_LIBRARY_PATH=/opt/maca/lib:$LD_LIBRARY_PATH
    ```
-3. Build Phoenix with the default `NVIDIA` vendor (no `-DPHXFS_VENDOR` change needed):
-   ```shell
-   mkdir -p build && cd build && cmake ../ && make -j
-   ```
-
-The rest of the install steps (kernel module load, tests) are unchanged.
+3. Build Phoenix with `-DPHXFS_VENDOR=METAX` — see [§2 Build Phoenix](#2-build-phoenix).
 
 ## 1. Storage backend
 
 Phoenix is storage-agnostic — it works on any storage device / filesystem that supports
-direct I/O: a local NVMe SSD (ext4/xfs, e.g. mounted at `/mnt/nvme0`), an NVMe-oF or
+direct I/O: a local NVMe SSD (ext4/xfs and anyother storage type, e.g. Raid/Loop), an NVMe-oF or
 RDMA-backed target, a parallel filesystem, etc. The only unsupported case is **FUSE**
 (its direct-I/O path cannot carry the P2P DMA). Just point Phoenix at the data file;
 nothing else to set up.
+
+NVMe-oF/RDMA-backed parallel filesystem is comming soon.
 
 ## 2. Build Phoenix
 
 ```shell
 mkdir -p build && cd build
-cmake ../
+cmake -DPHXFS_VENDOR=<vendor> ../      # see the options below; default is NVIDIA
 make -j
 ```
 This compiles the user library, the `phxfs` kernel module, and the tests.
 
+Vendor selection (`-DPHXFS_VENDOR=<value>`):
+
+```shell
+cmake -DPHXFS_VENDOR=NVIDIA ../       # default; CUDA Toolkit 12.4+ + NVIDIA driver
+cmake -DPHXFS_VENDOR=METAX ../        # MetaX MACA (CUDA-compatible, reuses NVIDIA connector)
+cmake -DPHXFS_VENDOR=AMD ../          # requires module/amd-backend.c + libphoenix/connectors/amd_connector.cpp
+cmake -DPHXFS_VENDOR=MTHREADS ../     # requires module/mthreads-backend.c + libphoenix/connectors/mthreads_connector.cpp
+cmake -DPHXFS_VENDOR=HUAWEI ../        # requires module/huawei-backend.c + libphoenix/connectors/huawei_connector.cpp
+```
+
+Other build options:
+
 - Skip the kernel module: `cmake -Dno_module=true ../`
-- Target a different accelerator vendor: `cmake -DPHXFS_VENDOR=AMD ../` (default `NVIDIA`).
+- Switch the default BAR mapping mode: `cmake -DPHXFS_MAP_MODE=full ../` (default `staging`; see [below](#bar-mapping-mode-staging-default-vs-full)).
 
 ## 3. Install
 
@@ -72,7 +111,8 @@ still installs the library.
 
 ### Load the kernel module
 
-Run `nvidia-smi` first (loads the NVIDIA driver), then:
+Load the vendor accelerator driver first (e.g. `nvidia-smi` on NVIDIA, or the equivalent
+command from your vendor's runtime), then:
 
 ```shell
 cd build
@@ -86,12 +126,12 @@ If installation fails, see [troubleshooting.md](troubleshooting.md).
 `phxfs` has two BAR mapping modes. The **default is STAGING**; FULL must be opted into.
 
 - **STAGING (`phxfs_map_mode=1`, default)** — remaps only a small Phoenix-owned staging pool;
-  user GPU memory is left unmapped so it stays registerable by RDMA/peermem (resolves the
-  BAR-remap / `dma_map_resource` conflict). Data flows SSD → staging pool → D2D copy → user
-  buffer. The safe, coexistence-friendly default.
+  user GPU memory is left unmapped so it stays registerable by RDMA / peer-memory frameworks
+  (e.g. NVIDIA `nvidia-peermem`, `ibv_reg_mr`) on the same GPU. Data flows SSD → staging pool
+  → D2D copy → user buffer. The safe, coexistence-friendly default.
 - **FULL (`phxfs_map_mode=0`)** — remaps the whole GPU BAR at load; registered user GPU
-  buffers DMA directly (no D2D hop). Maximum performance, but prevents peermem/RDMA from
-  registering GPU memory on the same GPU. Use on nodes without GPUDirect-RDMA.
+  buffers DMA directly (no D2D hop). Maximum performance, but prevents peer-memory / RDMA
+  frameworks from registering GPU memory on the same GPU. Use on nodes without peer-memory / RDMA.
 
 The default mode is chosen at build time and baked into the `.ko`; `make insmod` loads it as-is:
 
