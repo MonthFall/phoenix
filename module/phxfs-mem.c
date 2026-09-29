@@ -27,14 +27,20 @@
 static bool phxfs_parse_pat_line(const char *line, char *memtype,
 				 u64 *start, u64 *end)
 {
-	char range[128];
 	u64 cs, ce;
 
-	/* New format: "PAT: [mem 0x<start>-0x<end>] <type>". %s would swallow
-	 * the closing bracket, so the range is read with a scanset that stops
-	 * at ']' instead. */
-	if (sscanf(line, "PAT: [mem %127[^]]] %63s", range, memtype) == 2 &&
-	    sscanf(range, "0x%llx-0x%llx", &cs, &ce) == 2) {
+	/*
+	 * New format: "PAT: [mem 0x<start>-0x<end>] <type>".
+	 *
+	 * Do NOT read the range with a '%[...]' scanset: the kernel's vsscanf
+	 * deviates from glibc (see the warning in lib/vsprintf.c) -- it cannot
+	 * match the closing bracket ']' itself, and a negated set that starts
+	 * with ']' is empty, which makes vsscanf abort the whole scan and
+	 * return early. Read the range as two literal-0x numbers instead; the
+	 * literal ']' in the format matches the bracket in the input.
+	 */
+	if (sscanf(line, "PAT: [mem 0x%llx-0x%llx] %63s",
+		   &cs, &ce, memtype) == 3) {
 		*start = cs;
 		*end = ce;
 		return true;
