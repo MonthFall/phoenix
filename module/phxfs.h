@@ -72,8 +72,21 @@ struct phxfs_pat_conflict {
 
 /*
  * Read the PAT memtype list and extract the conflict ranges overlapping
- * [bar_start, bar_start + bar_len). Returns the number of conflicts found, or
- * a negative errno. conflicts[] is caller-allocated with max_entries capacity.
+ * [bar_start, bar_start + bar_len). conflicts[] is caller-allocated with
+ * max_entries capacity.
+ *
+ * Returns:
+ *   >= 0        snapshot valid; number of conflicts. 0 is a TRUSTED zero
+ *               (e.g. a snapshot whose entries are all write-back), not a
+ *               "detection did not work".
+ *   -errno      snapshot missing/unreadable/empty/unparseable (ENOENT, EIO,
+ *               ENODATA, EFBIG), conflicts[] capacity exceeded (ENOSPC), or
+ *               internal error (ENOMEM). Callers must treat this as "PAT
+ *               detection unavailable" and refuse the FULL load; never fold
+ *               it into a zero-conflict result.
+ *
+ * Non-x86 has no PAT memtype list at all: the function returns 0 there
+ * (trusted zero), preserving FULL's historical whole-BAR probing.
  */
 int phxfs_read_pat_conflicts(u64 bar_start, u64 bar_len,
 			     struct phxfs_pat_conflict *conflicts,

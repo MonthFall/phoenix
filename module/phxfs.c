@@ -188,6 +188,7 @@ int extract_trailing_number(const char str[]) {
 static int phxfs_devm_memremap(struct phxfs_dev *phx_dev) {
 	struct phxfs_pat_conflict *conflicts = NULL;
 	struct phxfs_bar_segment *segs = NULL;
+	long last_map_err = 0;
 	int n_conflicts, n_segments;
 	int i, ret = 1;
 
@@ -215,25 +216,33 @@ static int phxfs_devm_memremap(struct phxfs_dev *phx_dev) {
 						       conflicts, max_blocks);
 
 		/*
+		 * Fail-closed: detection did NOT work (missing / unreadable /
+		 * unparseable snapshot). Never pretend "no conflicts" -- the
+		 * old whole-BAR fallback is exactly the fail-open that mapped
+		 * straight across real vendor entries. Refuse the load and
+		 * point at the fix.
+		 */
+		if (n_conflicts < 0) {
+			phxfs_err("phxfs%d: PAT conflict detection unavailable "
+			       "(err=%d); refusing module load -- refresh "
+			       "the PAT snapshot via 'make insmod'\n",
+			       phx_dev->idx, n_conflicts);
+			kfree(conflicts);
+			return n_conflicts;
+		}
+
+		/*
 		 * The p2pdma bootstrap slice is already claimed by its own
 		 * pgmap, so no segment may cover it. The slice is drawn from
 		 * the remappable region, so the segment builder must always
 		 * route around it.
 		 */
-		if (n_conflicts >= 0 && phx_dev->p2p_slice_size &&
-		    n_conflicts < max_blocks) {
+		if (phx_dev->p2p_slice_size && n_conflicts < max_blocks) {
 			conflicts[n_conflicts].start = phx_dev->p2p_slice_start;
 			conflicts[n_conflicts].end = phx_dev->p2p_slice_start +
 						     phx_dev->p2p_slice_size;
 			n_conflicts++;
 		}
-	}
-	if (n_conflicts < 0) {
-		phxfs_warn("phxfs%d: PAT conflict detection failed (%d), "
-		       "falling back to full BAR remap\n", phx_dev->idx, n_conflicts);
-		kfree(conflicts);
-		/* Fallback: remap entire BAR as single segment */
-		goto fallback_single;
 	}
 
 	phxfs_info("phxfs%d: found %d PAT conflict(s) in BAR region\n",
@@ -254,9 +263,9 @@ static int phxfs_devm_memremap(struct phxfs_dev *phx_dev) {
 	kfree(conflicts);
 
 	if (n_segments <= 0) {
-		phxfs_warn("phxfs%d: no valid segments computed, "
-		       "falling back to full BAR remap\n", phx_dev->idx);
-		goto fallback_single;
+		phxfs_warn("phxfs%d: no valid segments computed (%d)\n",
+		       phx_dev->idx, n_segments);
+		return n_segments ? n_segments : -ENOSPC;
 	}
 
 	phxfs_info("phxfs%d: computed %d segment(s) after conflict skipping + merging\n",
@@ -304,12 +313,13 @@ static int phxfs_devm_memremap(struct phxfs_dev *phx_dev) {
 
 		va = devm_memremap_pages(&phx_dev->dev->dev, pgmap);
 		if (IS_ERR_OR_NULL(va)) {
+			last_map_err = IS_ERR(va) ? PTR_ERR(va) : -ENOMEM;
 			phxfs_warn("phxfs%d: devm_memremap_pages failed for "
 			       "segment %d (offset 0x%llx, size %llu MiB), err=%ld\n",
 			       phx_dev->idx, i,
 			       segs[i].phys_start - phx_dev->paddr,
 			       segs[i].size / (1024 * 1024),
-			       PTR_ERR(va));
+			       last_map_err);
 			devm_kfree(&phx_dev->dev->dev, p2p_pgmap);
 			/* Continue with remaining segments */
 			continue;
@@ -336,7 +346,7 @@ static int phxfs_devm_memremap(struct phxfs_dev *phx_dev) {
 
 	if (phx_dev->num_segments == 0) {
 		phxfs_err("phxfs%d: all segment remaps failed\n", phx_dev->idx);
-		ret = -ENOMEM;
+		ret = last_map_err ? (int)last_map_err : -ENOMEM;
 		goto err_cleanup;
 	}
 
@@ -360,74 +370,6 @@ static int phxfs_devm_memremap(struct phxfs_dev *phx_dev) {
 	}
 
 	return 0;
-
-fallback_single:
-	/* Legacy single-segment full BAR remap */
-	{
-		struct dev_pagemap *pgmap;
-
-		/* The bootstrap pgmap is devm-owned by the PCI device and survives a
-		 * phoenixfs reload. A whole-BAR fallback would overlap it and trigger
-		 * pagemap_range()'s "Conflicting mapping in same section" warning. */
-		if (phx_dev->p2p_slice_size) {
-			phxfs_err("phxfs%d: refusing full-BAR fallback: persistent "
-				   "p2pdma slice [0x%llx+0x%llx) must remain excluded\n",
-				   phx_dev->idx, phx_dev->p2p_slice_start,
-				   phx_dev->p2p_slice_size);
-			return -EEXIST;
-		}
-
-		phx_dev->p2p_pgmap = devm_kzalloc(&phx_dev->dev->dev,
-						    sizeof(struct phxfs_pgmap), GFP_KERNEL);
-		if (!phx_dev->p2p_pgmap)
-			return -ENOMEM;
-
-		ret = phxfs_pgmap_set_provider(phx_dev->p2p_pgmap, phx_dev);
-		if (ret) {
-			devm_kfree(&phx_dev->dev->dev, phx_dev->p2p_pgmap);
-			phx_dev->p2p_pgmap = NULL;
-			return ret;
-		}
-
-	phxfs_info("npu_devm_memremap 1\n");
-		pgmap = &phx_dev->p2p_pgmap->pgmap;
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
-		pgmap->range.start = phx_dev->paddr;
-		pgmap->range.end = phx_dev->paddr + phx_dev->size - 1;
-		pgmap->nr_range = 1;
-#else
-		phx_dev->pgmap_res.start = phx_dev->paddr;
-		phx_dev->pgmap_res.end = phx_dev->paddr + phx_dev->size - 1;
-		phx_dev->pgmap_res.flags = IORESOURCE_MEM;
-	phxfs_info("npu->pgmap->res.start is %llx, end is %llx\n",
-		phx_dev->pgmap_res.start, phx_dev->pgmap_res.end);
-		pgmap->res = phx_dev->pgmap_res;
-#endif
-		pgmap->type = MEMORY_DEVICE_PCI_P2PDMA;
-
-		phx_dev->pci_mem_va = devm_memremap_pages(&phx_dev->dev->dev, pgmap);
-
-	phxfs_info("npu numa is %d\n", phx_dev->dev->dev.numa_node);
-
-		if (IS_ERR_OR_NULL(phx_dev->pci_mem_va)) {
-			phxfs_err("phxfs%d: fallback devm_memremap_pages failed\n",
-			       phx_dev->idx);
-			devm_kfree(&phx_dev->dev->dev, phx_dev->p2p_pgmap);
-			return -ENOMEM;
-		}
-
-	phxfs_info("npu devm_memremap_pages success, addr is %lx\n",
-			(uintptr_t)phx_dev->pci_mem_va);
-		phx_dev->remap = 1;
-		phx_dev->segments = NULL;
-		phx_dev->num_segments = 0;
-		phx_dev->seg_capacity = 0;
-
-		phxfs_info("phxfs%d: fallback single-segment remap, va=0x%lx\n",
-		       phx_dev->idx, (unsigned long)phx_dev->pci_mem_va);
-		return 0;
-	}
 
 err_cleanup:
 	/* Clean up any segments that were successfully remapped */

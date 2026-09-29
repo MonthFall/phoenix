@@ -19,9 +19,50 @@
 #define PHXFS_PAT_BUF_SIZE (64 * 1024) /* PAT file typically < 16 KiB */
 
 /*
+ * Try to parse one PAT memtype line in either kernel format:
+ *   Linux <= 5.5 : "<type> @ 0x<start>-0x<end>"
+ *   Linux >= 5.6 : "PAT: [mem 0x<start>-0x<end>] <type>"
+ * Returns true and fills memtype (min 64 bytes) / start / end on success.
+ */
+static bool phxfs_parse_pat_line(const char *line, char *memtype,
+				 u64 *start, u64 *end)
+{
+	char range[128];
+	u64 cs, ce;
+
+	/* New format: "PAT: [mem 0x<start>-0x<end>] <type>". %s would swallow
+	 * the closing bracket, so the range is read with a scanset that stops
+	 * at ']' instead. */
+	if (sscanf(line, "PAT: [mem %127[^]]] %63s", range, memtype) == 2 &&
+	    sscanf(range, "0x%llx-0x%llx", &cs, &ce) == 2) {
+		*start = cs;
+		*end = ce;
+		return true;
+	}
+
+	/* Old format: "<type> @ 0x<start>-0x<end>" */
+	if (sscanf(line, "%63s @ 0x%llx-0x%llx", memtype, start, end) == 3)
+		return true;
+
+	return false;
+}
+
+/*
  * Read the PAT memtype snapshot and extract conflict ranges that overlap
  * with [bar_start, bar_start + bar_len).
- * Returns number of conflicts found, or negative errno.
+ *
+ * Return semantics (the FULL-mode segment planner relies on the distinction):
+ *   >= 0        snapshot valid; number of BAR conflicts. 0 is a trusted zero.
+ *   -ENOENT     snapshot does not exist (loaded without the make target)
+ *   -EIO        snapshot exists but could not be read
+ *   -ENODATA    snapshot empty, or non-empty without any recognizable data
+ *               line (suspected format drift / parser regression)
+ *   -EFBIG      snapshot larger than the read buffer (would be truncated)
+ *   -ENOSPC    conflicts[] capacity exceeded
+ *   -ENOMEM     allocation failure
+ *
+ * Only write-back entries are non-conflicting: every other memtype that
+ * overlaps the BAR is reported, clipped to [bar_start, bar_start + bar_len).
  * conflicts array is allocated by caller with max_entries capacity.
  */
 int phxfs_read_pat_conflicts(u64 bar_start, u64 bar_len,
@@ -32,7 +73,21 @@ int phxfs_read_pat_conflicts(u64 bar_start, u64 bar_len,
 	loff_t pos = 0;
 	char *buf;
 	int ret, n_conflicts = 0;
-	u64 bar_end = bar_start + bar_len;
+	u64 bar_end;
+
+	if (!IS_ENABLED(CONFIG_X86)) {
+		/*
+		 * Non-x86 has no PAT memtype list at all, so there is nothing
+		 * to detect -- and nothing that could fail. FULL keeps its
+		 * historical whole-BAR probing there (the segment planner then
+		 * only routes around the p2pdma bootstrap slice).
+		 */
+		return 0;
+	}
+
+	if (bar_len > U64_MAX - bar_start)
+		return -EINVAL;
+	bar_end = bar_start + bar_len;
 
 	buf = kzalloc(PHXFS_PAT_BUF_SIZE, GFP_KERNEL);
 	if (!buf)
@@ -41,62 +96,106 @@ int phxfs_read_pat_conflicts(u64 bar_start, u64 bar_len,
 	filp = filp_open(PHXFS_PAT_PATH, O_RDONLY, 0);
 	if (IS_ERR(filp)) {
 		phxfs_warn("phxfs: cannot open PAT snapshot %s (err=%ld); "
-		       "load the module with 'make insmod' to generate it; "
-		       "skipping PAT conflict detection\n",
+		       "load the module with 'make insmod' to generate it\n",
 		       PHXFS_PAT_PATH, PTR_ERR(filp));
 		kfree(buf);
-		return 0; /* graceful: no conflicts detected */
+		return PTR_ERR(filp);
 	}
 
 	ret = kernel_read(filp, buf, PHXFS_PAT_BUF_SIZE - 1, &pos);
+	/* Reject a snapshot that would not fit: a truncated last line could
+	 * otherwise silently drop a real conflict. */
+	if (ret >= 0 && ret == PHXFS_PAT_BUF_SIZE - 1 &&
+	    i_size_read(file_inode(filp)) > (u64)ret) {
+		phxfs_warn("phxfs: PAT snapshot %s exceeds the %d byte read "
+		       "buffer; refusing to parse a truncated list\n",
+		       PHXFS_PAT_PATH, PHXFS_PAT_BUF_SIZE - 1);
+		filp_close(filp, NULL);
+		kfree(buf);
+		return -EFBIG;
+	}
 	filp_close(filp, NULL);
 
-	if (ret <= 0) {
+	if (ret < 0) {
 		phxfs_warn("phxfs: failed to read %s (ret=%d)\n",
 		       PHXFS_PAT_PATH, ret);
 		kfree(buf);
-		return 0;
+		return -EIO;
+	}
+	if (ret == 0) {
+		phxfs_warn("phxfs: PAT snapshot %s is empty; refresh it via "
+		       "'make insmod'\n", PHXFS_PAT_PATH);
+		kfree(buf);
+		return -ENODATA;
 	}
 	buf[ret] = '\0';
 
-	/* Parse lines like: "write-combining @ 0x21a000800000-0x21a000900000" */
 	{
 		char *line = buf;
+		int n_data = 0, n_unknown = 0;
+		const char *first_unknown = NULL;
+
 		while (line && *line) {
 			char *nl = strchr(line, '\n');
-			u64 cs, ce;
 			char memtype[64] = {0};
+			u64 cs, ce;
 
 			if (nl)
 				*nl = '\0';
 
-			/* Skip write-back entries - they don't conflict with cached mapping */
-			if (strncmp(line, "write-back", 10) == 0 ||
-			    strncmp(line, "PAT", 3) == 0) {
+			/* Skip blank lines (whitespace only) */
+			if (strspn(line, " \t\r") == strlen(line)) {
 				line = nl ? nl + 1 : NULL;
 				continue;
 			}
 
-			/* Try to parse: <memtype> @ 0x<start>-0x<end> */
-			if (sscanf(line, "%63s @ 0x%llx-0x%llx", memtype, &cs, &ce) == 3) {
-				/* Check if this range overlaps with our BAR window */
-				if (cs < bar_end && ce > bar_start) {
-					/* Clip to BAR range */
-					u64 clipped_start = max(cs, bar_start);
-					u64 clipped_end = min(ce, bar_end);
+			if (!phxfs_parse_pat_line(line, memtype, &cs, &ce) ||
+			    ce <= cs) {
+				n_unknown++;
+				if (!first_unknown)
+					first_unknown = line;
+				line = nl ? nl + 1 : NULL;
+				continue;
+			}
+			n_data++;
 
-					if (n_conflicts < max_entries) {
-						conflicts[n_conflicts].start = clipped_start;
-						conflicts[n_conflicts].end = clipped_end;
-						n_conflicts++;
-					} else {
-						phxfs_warn("phxfs: too many PAT conflicts "
-						       "(>%d), some skipped\n", max_entries);
-						break;
-					}
+			/* write-back entries do not conflict with a cached
+			 * (struct page) mapping */
+			if (strcmp(memtype, "write-back") == 0) {
+				line = nl ? nl + 1 : NULL;
+				continue;
+			}
+
+			if (cs < bar_end && ce > bar_start) {
+				u64 clipped_start = max(cs, bar_start);
+				u64 clipped_end = min(ce, bar_end);
+
+				if (n_conflicts >= max_entries) {
+					phxfs_warn("phxfs: too many PAT "
+					       "conflicts (>%d)\n", max_entries);
+					kfree(buf);
+					return -ENOSPC;
 				}
+				conflicts[n_conflicts].start = clipped_start;
+				conflicts[n_conflicts].end = clipped_end;
+				n_conflicts++;
 			}
 			line = nl ? nl + 1 : NULL;
+		}
+
+		if (n_data == 0) {
+			phxfs_warn("phxfs: PAT snapshot %s contains no "
+			       "recognizable memtype data line (%d "
+			       "unrecognized line%s); suspected format drift "
+			       "or parser regression -- refresh it via 'make "
+			       "insmod' and report if it persists\n",
+			       PHXFS_PAT_PATH, n_unknown,
+			       n_unknown == 1 ? "" : "s");
+			if (first_unknown)
+				phxfs_warn("phxfs: first unrecognized line: "
+				       "'%s'\n", first_unknown);
+			kfree(buf);
+			return -ENODATA;
 		}
 	}
 

@@ -12,7 +12,7 @@ KERNEL_SRC := /lib/modules/$(KVER)/build
 PAT_MEMTYPE_SOURCE := /sys/kernel/debug/x86/pat_memtype_list
 PAT_MEMTYPE_SNAPSHOT := /run/phxfs/pat_memtype_list
 
-.PHONY: all phxfs configure prepare_sources refresh-pat-snapshot insmod insmod-staging insmod-full rmmod install clean
+.PHONY: all phxfs configure prepare_sources refresh-pat-snapshot pat-check insmod insmod-staging insmod-full rmmod install clean
 
 all: phxfs
 
@@ -37,8 +37,8 @@ configure: prepare_sources
 
 # kernel_read() cannot consume the legacy debugfs .read implementation on
 # modern kernels. Snapshot it from user space into a regular tmpfs file first.
-# A failed refresh removes any stale snapshot but remains fail-open, matching
-# the module's existing PAT preflight behavior.
+# A failed refresh removes any stale snapshot; FULL (x86) then refuses to load
+# without it and pat-check below flags the same condition.
 refresh-pat-snapshot:
 	@sudo sh -c '\
 		set -eu; \
@@ -62,6 +62,39 @@ refresh-pat-snapshot:
 		trap - EXIT HUP INT TERM; \
 		echo ">> refreshed PAT snapshot: $$dst"'
 
+# Deployment-time PAT environment check (advisory; runs on `make install`
+# after the snapshot refresh). Mirrors the kernel-side parser in
+# phxfs-mem.c phxfs_read_pat_conflicts() -- keep the two in sync:
+#   old (Linux <= 5.5): "<type> @ 0x<start>-0x<end>"
+#   new (Linux >= 5.6): "PAT: [mem 0x<start>-0x<end>] <type>"
+# Reports the snapshot status only -- parsed line count on success, the
+# specific failure reason otherwise. 
+pat-check:
+	@sudo sh -c '\
+		dst="$(PAT_MEMTYPE_SNAPSHOT)"; \
+		case "$$(uname -m)" in \
+			x86_64) ;; \
+			*) echo ">> PAT check: non-x86 arch ($$(uname -m)); PAT memtype list does not exist"; \
+			   exit 0 ;; \
+		esac; \
+		if grep -qE "(^|[[:space:]])nopat([[:space:]]|\$$)" /proc/cmdline 2>/dev/null; then \
+			echo ">> PAT check: FAIL -- kernel booted with nopat; PAT memtypes are disabled"; \
+			exit 0; \
+		fi; \
+		if [ ! -s "$$dst" ]; then \
+			echo ">> PAT check: FAIL -- PAT snapshot $$dst is missing or empty"; \
+			echo ">>   (debugfs unavailable, or the refresh above failed)"; \
+			exit 0; \
+		fi; \
+		ndata=$$(grep -Ec "^[^[:space:]]+ @ 0x[0-9a-fA-F]+-0x[0-9a-fA-F]+[[:space:]]*\$$|^PAT: \[mem 0x[0-9a-fA-F]+-0x[0-9a-fA-F]+\][[:space:]]+[^[:space:]]+" "$$dst" 2>/dev/null || true); \
+		ndata=$${ndata:-0}; \
+		if [ "$$ndata" -lt 1 ]; then \
+			echo ">> PAT check: FAIL -- snapshot exists but contains no recognizable memtype line"; \
+			echo ">>   (suspected corruption or unknown kernel format; compare with phxfs-mem.c)"; \
+			exit 0; \
+		fi; \
+		echo ">> PAT check: OK ($$ndata memtype line(s), old+new formats both supported)"'
+
 # Optional MAP_MODE=0|1 overrides the baked-in default BAR map mode for this load
 # (e.g. `make insmod MAP_MODE=0`). Empty -> load the cmake-configured default.
 # Optional DEBUG_MODE=0|1 applies to every insmod* target and toggles the
@@ -78,7 +111,7 @@ insmod-full: refresh-pat-snapshot
 	sudo insmod phoenixfs.ko phxfs_map_mode=0 $(if $(strip $(DEBUG_MODE)),phxfs_debug=$(strip $(DEBUG_MODE)),)
 rmmod:
 	sudo rmmod phoenixfs
-install: refresh-pat-snapshot
+install: refresh-pat-snapshot pat-check
 	@if [ ! -f phoenixfs.ko ]; then \
 		echo ">> phoenixfs.ko not found (build first, or module disabled); skipping"; \
 		exit 0; \

@@ -127,7 +127,7 @@ still installs the library. Although `make install` re-invokes the build, the mo
 incremental — unchanged sources (and an unchanged kernel configuration probe) are not
 recompiled.
 
-It also refreshes the root-only PAT memtype snapshot at `/run/phxfs/pat_memtype_list` when debugfs is available.
+It also refreshes the root-only PAT memtype snapshot at `/run/phxfs/pat_memtype_list` when debugfs is available, then runs a PAT environment check that reports the snapshot status: the parsed memtype line count on success, or the specific failure reason (missing snapshot, `nopat` boot, unparseable content) otherwise.
 
 ### Load the kernel module
 
@@ -140,9 +140,15 @@ sudo make insmod          # loads phoenixfs.ko with the build's default mode (ST
 ```
 
 All `make insmod*` targets refresh `/run/phxfs/pat_memtype_list` immediately before loading.
-A direct module load without that snapshot remains fail-open and logs a warning directing the
-user to reload through `make insmod*`. If debugfs is unavailable during refresh, any stale
-snapshot is removed.
+On x86 the snapshot is a hard requirement for **both** map modes: the p2pdma bootstrap
+slice (a prerequisite of STAGING and FULL alike — every BAR page handed a struct page
+needs the p2pdma provider, whose placement consults the snapshot) and FULL's BAR segment
+planning both depend on it. Any load without a valid snapshot — a direct `insmod`
+bypassing the make targets, a `nopat` boot, or an unknown kernel format — therefore fails
+with a logged reason, whichever mode is selected. On non-x86 architectures (e.g. METAX)
+there is no PAT memtype list at all; the module keeps its historical whole-BAR behavior
+there, since there is nothing to detect. If debugfs is unavailable during refresh, any
+stale snapshot is removed.
 
 If installation fails, see [troubleshooting.md](troubleshooting.md).
 

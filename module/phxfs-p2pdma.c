@@ -122,6 +122,17 @@ static int phxfs_p2pdma_bootstrap(struct phxfs_dev *phx_dev)
 	n_conflicts = phxfs_read_pat_conflicts(span_start, span_len, conflicts,
 					       n_blocks);
 	if (n_conflicts < 0) {
+		/*
+		 * Fail-closed, for BOTH map modes: the bootstrap slice has to
+		 * avoid vendor-held BAR ranges and without a usable snapshot
+		 * we cannot know which those are. The p2pdma provider is a
+		 * prerequisite for handing any BAR page a struct page, so
+		 * STAGING cannot proceed either.
+		 */
+		phxfs_err("phxfs%d: PAT conflict detection unavailable (%d); "
+		       "cannot place the p2pdma bootstrap slice -- refresh "
+		       "the PAT snapshot via 'make insmod'\n",
+		       phx_dev->idx, n_conflicts);
 		ret = n_conflicts;
 		goto out;
 	}
